@@ -24,11 +24,7 @@ impl std::fmt::Display for RecordError {
                 write!(f, "Type mismatch: expected {}, got {}", expected, actual)
             }
             RecordError::LengthMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "Length mismatch: expected {}, got {}",
-                    expected, actual
-                )
+                write!(f, "Length mismatch: expected {}, got {}", expected, actual)
             }
             RecordError::FieldExists => write!(f, "Field already exists"),
             RecordError::CborError(msg) => write!(f, "CBOR error: {}", msg),
@@ -80,9 +76,14 @@ pub const INDEX_ENTRY_SIZE: usize = 20; // 8 + 4 + 4 + 1 + 3
 pub fn serialize_record(data: &SpookyValue) -> Result<Vec<u8>, RecordError> {
     let map = match data {
         SpookyValue::Object(map) => map,
-        _ => return Err(RecordError::TypeMismatch { expected: TAG_NESTED_CBOR, actual: TAG_NULL }), // Using TAG_NULL as a placeholder for "not an object" or better yet, define a mismatch error. Actually, let's allow "not an object" to be a TypeMismatch or just a CborError? No, the caller expects an object. Let's say TypeMismatch expected object/map. But wait, existing code used panic.
-        // Let's use TypeMismatch. But we don't have a TAG_OBJECT constant readily available in the 0-6 range that matches SpookyValue variants exactly without looking at `spooky_value.rs`.
-        // Let's just say if it's not an object, we return valid error.
+        _ => {
+            return Err(RecordError::TypeMismatch {
+                expected: TAG_NESTED_CBOR,
+                actual: TAG_NULL,
+            });
+        } // Using TAG_NULL as a placeholder for "not an object" or better yet, define a mismatch error. Actually, let's allow "not an object" to be a TypeMismatch or just a CborError? No, the caller expects an object. Let's say TypeMismatch expected object/map. But wait, existing code used panic.
+          // Let's use TypeMismatch. But we don't have a TAG_OBJECT constant readily available in the 0-6 range that matches SpookyValue variants exactly without looking at `spooky_value.rs`.
+          // Let's just say if it's not an object, we return valid error.
     };
 
     let field_count = map.len();
@@ -144,7 +145,8 @@ pub fn serialize_field(value: &SpookyValue) -> Result<(Vec<u8>, u8), RecordError
         SpookyValue::Str(s) => (s.as_bytes().to_vec(), TAG_STR),
         SpookyValue::Array(_) | SpookyValue::Object(_) => {
             let mut buf = Vec::new();
-            ciborium::into_writer(value, &mut buf).map_err(|e| RecordError::CborError(e.to_string()))?;
+            ciborium::into_writer(value, &mut buf)
+                .map_err(|e| RecordError::CborError(e.to_string()))?;
             (buf, TAG_NESTED_CBOR)
         }
     })
@@ -174,7 +176,11 @@ impl<'a> SpookyRecord<'a> {
         if bytes.len() < HEADER_SIZE {
             return Err(RecordError::InvalidBuffer);
         }
-        let field_count = u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| RecordError::InvalidBuffer)?);
+        let field_count = u32::from_le_bytes(
+            bytes[0..4]
+                .try_into()
+                .map_err(|_| RecordError::InvalidBuffer)?,
+        );
         let min_size = HEADER_SIZE + field_count as usize * INDEX_ENTRY_SIZE;
         if bytes.len() < min_size {
             return Err(RecordError::InvalidBuffer);
