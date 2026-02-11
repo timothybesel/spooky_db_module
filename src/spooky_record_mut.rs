@@ -661,13 +661,56 @@ impl SpookyRecordMut {
 
     /// Get any field as a SpookyValue (deserializes nested CBOR if needed).
     pub fn get_field(&self, name: &str) -> Option<SpookyValue> {
+        let field = self.get_raw(name)?;
+        decode_field(field)
+    }
+
+    /// Get raw field reference (zero-copy).
+    pub fn get_raw(&self, name: &str) -> Option<FieldRef<'_>> {
         let (_, meta) = self.find_field(name).ok()?;
         let data = &self.buf[meta.data_offset..meta.data_offset + meta.data_length];
-        decode_field(FieldRef {
+        Some(FieldRef {
             name_hash: meta.name_hash,
             type_tag: meta.type_tag,
             data,
         })
+    }
+
+    /// Get a numeric field as f64 (converting i64/u64 if needed).
+    pub fn get_number_as_f64(&self, name: &str) -> Option<f64> {
+        let (_, meta) = self.find_field(name).ok()?;
+        match meta.type_tag {
+            TAG_F64 => {
+                let bytes: [u8; 8] = self.buf[meta.data_offset..meta.data_offset + 8]
+                    .try_into()
+                    .ok()?;
+                Some(f64::from_le_bytes(bytes))
+            }
+            TAG_I64 => {
+                let bytes: [u8; 8] = self.buf[meta.data_offset..meta.data_offset + 8]
+                    .try_into()
+                    .ok()?;
+                Some(i64::from_le_bytes(bytes) as f64)
+            }
+            TAG_U64 => {
+                let bytes: [u8; 8] = self.buf[meta.data_offset..meta.data_offset + 8]
+                    .try_into()
+                    .ok()?;
+                Some(u64::from_le_bytes(bytes) as f64)
+            }
+            _ => None,
+        }
+    }
+
+    /// Convert to SpookyValue (iterator-based full conversion placeholder).
+    /// Note: Keys are not recoverable from hashes in the current format.
+    pub fn to_value(&self) -> SpookyValue {
+        SpookyValue::Null // Placeholder as per parity plan constraint
+    }
+
+    /// Iterate over all raw fields (zero-copy)
+    pub fn iter_fields(&self) -> crate::spooky_record::FieldIter<'_> {
+        self.as_record().iter_fields()
     }
 
     /// Check if a field exists.
@@ -716,7 +759,7 @@ impl SpookyRecordMut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spooky_record::{serialize_record, TAG_NULL};
+    use crate::spooky_record::{TAG_NULL, SpookyRecord};
     use crate::spooky_value::FastMap;
     use smol_str::SmolStr;
 
@@ -753,7 +796,7 @@ mod tests {
     fn test_from_serialize_record() {
         // Verify SpookyRecordMut works with buffers from serialize_record()
         let val = make_test_value();
-        let bytes = serialize_record(&val).unwrap();
+        let bytes = SpookyRecord::serialize(&val).unwrap();
         let rec = SpookyRecordMut::from_vec(bytes).unwrap();
         assert_eq!(rec.get_str("name"), Some("Alice"));
         assert_eq!(rec.get_i64("age"), Some(30));
@@ -897,6 +940,33 @@ mod tests {
         let mut rec = make_record_mut();
         rec.set_field("age", &SpookyValue::from(99i64)).unwrap();
         assert_eq!(rec.get_i64("age"), Some(99));
+    }
+
+    #[test]
+    fn test_add_field_resize() {
+        let mut rec = make_record_mut();
+        // Add a field that forces buffer growth/move
+        let long_str = "x".repeat(100);
+        rec.add_field("description", &SpookyValue::from(long_str.as_str())).unwrap();
+
+        assert_eq!(rec.get_str("description"), Some(long_str.as_str()));
+        // Verify old fields still work
+        assert_eq!(rec.get_str("name"), Some("Alice"));
+    }
+
+    #[test]
+    fn test_parity_methods() {
+        let rec = make_record_mut();
+        assert!(rec.get_raw("age").is_some());
+        assert!(rec.get_raw("missing").is_none());
+
+        assert_eq!(rec.get_number_as_f64("age"), Some(30.0));
+        assert_eq!(rec.get_number_as_f64("score"), Some(99.5));
+        assert_eq!(rec.get_number_as_f64("name"), None);
+
+        let fields: Vec<_> = rec.iter_fields().collect();
+        assert_eq!(fields.len(), 6);
+        assert_eq!(rec.get_f64("score"), Some(99.5));
     }
 
     #[test]

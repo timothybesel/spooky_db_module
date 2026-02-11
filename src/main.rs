@@ -2,7 +2,6 @@ mod spooky_record;
 mod spooky_record_mut;
 mod spooky_value;
 
-use spooky_record::serialize_record;
 use spooky_value::SpookyValue;
 
 const TEST_CBOR: &[u8] = &[
@@ -23,13 +22,14 @@ fn main() {
     let spooky = SpookyValue::from(cbor_val);
     println!("Parsed SpookyValue:\n{:#?}\n", spooky);
 
-    // Step 2: Serialize to hybrid binary format
-    let binary = serialize_record(&spooky).expect("serialize_record failed");
+    // Step 2: Serialize to hybrid binary
+    println!("\n--- Serializing to binary ---");
+    let binary = spooky_record::SpookyRecord::serialize(&spooky).unwrap();
     println!("Hybrid binary: {} bytes\n", binary.len());
 
     println!("=== READ PATH: Zero-copy field access ===\n");
 
-    // Step 3: Wrap binary as HybridRecord (zero-copy, no parsing)
+    // Step 3: Wrap binary as SpookyRecord (zero-copy, no parsing)
     let record = spooky_record::SpookyRecord::from_bytes(&binary).unwrap();
     println!("Field count: {}\n", record.field_count());
 
@@ -40,40 +40,48 @@ fn main() {
     println!("  email(str): {:?}", record.get_str("email"));
     println!("  id   (str): {:?}", record.get_str("id"));
 
-    // SpookyValue accessor — allocates only for the requested field
-    println!("\n--- Selective SpookyValue reads ---");
-    println!("  profile: {:#?}", record.get_field("profile"));
-    println!("  age:     {:#?}", record.get_field("age"));
+    // SpookyValue accessor — allocates only for    // 2. Serialize to hybrid binary
+    // Using the new static method on SpookyRecord
+    println!("\n--- Serializing to binary ---");
+    let binary = spooky_record::SpookyRecord::serialize(&spooky).unwrap();
+    println!("Binary size: {} bytes", binary.len());
 
-    // Iterate all raw fields (zero-copy)
-    println!("\n--- Raw field iteration ---");
-    for field in record.iter_fields() {
-        println!(
-            "  hash={:016x} tag={} len={}",
-            field.name_hash,
-            field.type_tag,
-            field.data.len()
-        );
-    }
+    // 3. Read back (zero-copy)
+    println!("\n--- Reading from SpookyRecord (zero-copy) ---");
+    let record = spooky_record::SpookyRecord::from_bytes(&binary).unwrap();
+    println!("Field count: {}", record.field_count());
+    println!("id: {:?}", record.get_str("id")); // Some("user:123")
+    println!("age: {:?}", record.get_i64("age")); // Some(30)
+    println!("active: {:?}", record.get_bool("active")); // Some(true)
 
-    println!("\n=== MUTATE PATH: Zero-alloc updates ===\n");
+    // Demonstrate new parity method
+    println!("Type of 'age': {:?}", record.field_type("age")); // Some(2) -> TAG_I64
 
-    // Step 4: Create mutable record from the same binary
-    // Note: We clone binary because we used it immutably above.
-    let mut rec_mut = spooky_record_mut::SpookyRecordMut::from_vec(binary.clone()).unwrap();
+    // 4. Mutation
+    println!("\n--- Mutating with SpookyRecordMut ---");
+    let mut mut_record = spooky_record_mut::SpookyRecordMut::from_vec(binary).unwrap();
 
-    // Modify existing field (same type, same size -> fast path)
-    rec_mut.set_i64("age", 31).unwrap();
-    println!("Updated age: {:?}", rec_mut.get_i64("age"));
+    // Modify in-place
+    mut_record.set_i64("age", 31).unwrap();
+    println!("Updated age: {:?}", mut_record.get_i64("age"));
 
-    // Modify string (different size -> splice path)
-    // "Alice" -> "Alice Modified"
-    rec_mut.set_str("name", "Alice Modified").unwrap();
-    println!("Updated name: {:?}", rec_mut.get_str("name"));
+    // Modify string (splice if length changes)
+    mut_record
+        .set_str("name", "Alice Modified")
+        .unwrap();
+    println!("Updated name: {:?}", mut_record.get_str("name"));
 
     // Add new field
-    rec_mut.add_field("new_field", &SpookyValue::from(12345u64)).unwrap();
-    println!("Added field 'new_field': {:?}", rec_mut.get_u64("new_field"));
+    mut_record
+        .add_field("new_field", &SpookyValue::from(12345))
+        .unwrap();
+    println!(
+        "Added field 'new_field': {:?}",
+        mut_record.get_i64("new_field")
+    );
 
-    println!("Final size: {} bytes", rec_mut.byte_len());
+    // Verify parity method in Mut
+    println!("get_number_as_f64('score'): {:?}", mut_record.get_number_as_f64("score"));
+
+    println!("Final size: {} bytes", mut_record.byte_len());
 }

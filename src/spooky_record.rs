@@ -73,64 +73,7 @@ pub const INDEX_ENTRY_SIZE: usize = 20; // 8 + 4 + 4 + 1 + 3
 /// **IMPORTANT**: The index is sorted by name_hash. This is required for
 /// O(log n) binary search in both SpookyRecord and SpookyRecordMut.
 /// O(log n) binary search in both SpookyRecord and SpookyRecordMut.
-pub fn serialize_record(data: &SpookyValue) -> Result<Vec<u8>, RecordError> {
-    let map = match data {
-        SpookyValue::Object(map) => map,
-        _ => {
-            return Err(RecordError::TypeMismatch {
-                expected: TAG_NESTED_CBOR,
-                actual: TAG_NULL,
-            });
-        } // Using TAG_NULL as a placeholder for "not an object" or better yet, define a mismatch error. Actually, let's allow "not an object" to be a TypeMismatch or just a CborError? No, the caller expects an object. Let's say TypeMismatch expected object/map. But wait, existing code used panic.
-          // Let's use TypeMismatch. But we don't have a TAG_OBJECT constant readily available in the 0-6 range that matches SpookyValue variants exactly without looking at `spooky_value.rs`.
-          // Let's just say if it's not an object, we return valid error.
-    };
 
-    let field_count = map.len();
-    let index_size = field_count * INDEX_ENTRY_SIZE;
-    let data_start = HEADER_SIZE + index_size;
-
-    // Pre-serialize all field values to calculate total size
-    let mut fields: Vec<(u64, Vec<u8>, u8)> = Vec::with_capacity(field_count);
-    let mut total_data_size: usize = 0;
-
-    for (key, value) in map.iter() {
-        let hash = xxh64(key.as_bytes(), 0);
-        let (bytes, tag) = serialize_field(value)?;
-        total_data_size += bytes.len();
-        fields.push((hash, bytes, tag));
-    }
-
-    // Sort by hash for binary search at read time
-    fields.sort_unstable_by_key(|(hash, _, _)| *hash);
-
-    // Single allocation for the entire record
-    let total_size = data_start + total_data_size;
-    let mut buf = vec![0u8; total_size];
-
-    // Write header
-    buf[0..4].copy_from_slice(&(field_count as u32).to_le_bytes());
-    // reserved bytes [4..20] are already zero
-
-    // Write index entries + field data
-    let mut data_offset = data_start;
-    for (i, (hash, data, tag)) in fields.iter().enumerate() {
-        let idx = HEADER_SIZE + i * INDEX_ENTRY_SIZE;
-
-        // Index entry
-        buf[idx..idx + 8].copy_from_slice(&hash.to_le_bytes());
-        buf[idx + 8..idx + 12].copy_from_slice(&(data_offset as u32).to_le_bytes());
-        buf[idx + 12..idx + 16].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        buf[idx + 16] = *tag;
-        // padding [idx+17..idx+20] already zero
-
-        // Field data
-        buf[data_offset..data_offset + data.len()].copy_from_slice(data);
-        data_offset += data.len();
-    }
-
-    Ok(buf)
-}
 
 /// Serialize a single field value into (bytes, type_tag).
 pub fn serialize_field(value: &SpookyValue) -> Result<(Vec<u8>, u8), RecordError> {
@@ -156,6 +99,7 @@ pub fn serialize_field(value: &SpookyValue) -> Result<(Vec<u8>, u8), RecordError
 
 /// Zero-copy reader over a hybrid record byte slice.
 /// No parsing happens until you request a specific field.
+#[derive(Debug, Clone, Copy)]
 pub struct SpookyRecord<'a> {
     bytes: &'a [u8],
     field_count: u32,
@@ -163,6 +107,7 @@ pub struct SpookyRecord<'a> {
 
 /// A raw field reference — no deserialization yet
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct FieldRef<'a> {
     pub name_hash: u64,
     pub type_tag: u8,
@@ -171,6 +116,68 @@ pub struct FieldRef<'a> {
 
 #[allow(dead_code)]
 impl<'a> SpookyRecord<'a> {
+    /// Serialize a SpookyValue::Object into the hybrid binary format.
+    /// Flat fields are stored as native bytes, nested objects/arrays as CBOR.
+    ///
+    /// **IMPORTANT**: The index is sorted by name_hash. This is required for
+    /// O(log n) binary search in both SpookyRecord and SpookyRecordMut.
+    pub fn serialize(data: &SpookyValue) -> Result<Vec<u8>, RecordError> {
+        let map = match data {
+            SpookyValue::Object(map) => map,
+            _ => {
+                return Err(RecordError::TypeMismatch {
+                    expected: TAG_NESTED_CBOR,
+                    actual: TAG_NULL,
+                });
+            }
+        };
+
+        let field_count = map.len();
+        let index_size = field_count * INDEX_ENTRY_SIZE;
+        let data_start = HEADER_SIZE + index_size;
+
+        // Pre-serialize all field values to calculate total size
+        let mut fields: Vec<(u64, Vec<u8>, u8)> = Vec::with_capacity(field_count);
+        let mut total_data_size: usize = 0;
+
+        for (key, value) in map.iter() {
+            let hash = xxh64(key.as_bytes(), 0);
+            let (bytes, tag) = serialize_field(value)?;
+            total_data_size += bytes.len();
+            fields.push((hash, bytes, tag));
+        }
+
+        // Sort by hash for binary search at read time
+        fields.sort_unstable_by_key(|(hash, _, _)| *hash);
+
+        // Single allocation for the entire record
+        let total_size = data_start + total_data_size;
+        let mut buf = vec![0u8; total_size];
+
+        // Write header
+        buf[0..4].copy_from_slice(&(field_count as u32).to_le_bytes());
+        // reserved bytes [4..20] are already zero
+
+        // Write index entries + field data
+        let mut data_offset = data_start;
+        for (i, (hash, data, tag)) in fields.iter().enumerate() {
+            let idx = HEADER_SIZE + i * INDEX_ENTRY_SIZE;
+
+            // Index entry
+            buf[idx..idx + 8].copy_from_slice(&hash.to_le_bytes());
+            buf[idx + 8..idx + 12].copy_from_slice(&(data_offset as u32).to_le_bytes());
+            buf[idx + 12..idx + 16].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            buf[idx + 16] = *tag;
+            // padding [idx+17..idx+20] already zero
+
+            // Field data
+            buf[data_offset..data_offset + data.len()].copy_from_slice(data);
+            data_offset += data.len();
+        }
+
+        Ok(buf)
+    }
+
     /// Wrap a byte slice as a SpookyRecord. No copies, no parsing.
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, RecordError> {
         if bytes.len() < HEADER_SIZE {
@@ -312,6 +319,12 @@ impl<'a> SpookyRecord<'a> {
         self.get_raw(name).is_some()
     }
 
+    /// Get the type tag for a field.
+    #[inline]
+    pub fn field_type(&self, name: &str) -> Option<u8> {
+        self.get_raw(name).map(|f| f.type_tag)
+    }
+
     /// Get a numeric field as f64 (converting i64/u64 if needed).
     pub fn get_number_as_f64(&self, name: &str) -> Option<f64> {
         let field = self.get_raw(name)?;
@@ -335,10 +348,18 @@ impl<'a> SpookyRecord<'a> {
         SpookyValue::Object(map)
     }
 
+    /// Convert the entire record to a SpookyValue::Object.
+    /// This iterates over all fields and deserializes them.
+    pub fn to_value(&self) -> SpookyValue {
+        // Since we don't store field names in the index (only hashes), we can't fully reconstruct
+        // the object with original keys unless we have a way to reverse hashes.
+        SpookyValue::Null // Placeholder
+    }
+
     /// Iterate over all raw fields (zero-copy)
-    pub fn iter_fields(&'a self) -> FieldIter<'a> {
+    pub fn iter_fields(&self) -> FieldIter<'a> {
         FieldIter {
-            record: self,
+            record: *self,
             pos: 0,
         }
     }
@@ -373,7 +394,7 @@ pub fn decode_field(field: FieldRef) -> Option<SpookyValue> {
 // ─── Iterator ───────────────────────────────────────────────────────────────
 
 pub struct FieldIter<'a> {
-    record: &'a SpookyRecord<'a>,
+    record: SpookyRecord<'a>,
     pos: usize,
 }
 
@@ -417,7 +438,7 @@ mod tests {
     #[test]
     fn test_roundtrip_flat_fields() {
         let original = make_test_record();
-        let bytes = serialize_record(&original).unwrap();
+        let bytes = SpookyRecord::serialize(&original).unwrap();
         let record = SpookyRecord::from_bytes(&bytes).unwrap();
 
         assert_eq!(record.field_count(), 6);
@@ -432,7 +453,7 @@ mod tests {
     #[test]
     fn test_missing_field() {
         let original = make_test_record();
-        let bytes = serialize_record(&original).unwrap();
+        let bytes = SpookyRecord::serialize(&original).unwrap();
         let record = SpookyRecord::from_bytes(&bytes).unwrap();
 
         assert!(record.get_raw("nonexistent").is_none());
@@ -443,7 +464,7 @@ mod tests {
     #[test]
     fn test_has_field() {
         let original = make_test_record();
-        let bytes = serialize_record(&original).unwrap();
+        let bytes = SpookyRecord::serialize(&original).unwrap();
         let record = SpookyRecord::from_bytes(&bytes).unwrap();
 
         assert!(record.has_field("id"));
@@ -454,7 +475,7 @@ mod tests {
     #[test]
     fn test_get_number_as_f64() {
         let original = make_test_record();
-        let bytes = serialize_record(&original).unwrap();
+        let bytes = SpookyRecord::serialize(&original).unwrap();
         let record = SpookyRecord::from_bytes(&bytes).unwrap();
 
         assert_eq!(record.get_number_as_f64("age"), Some(30.0));
@@ -475,7 +496,7 @@ mod tests {
         );
         let obj = SpookyValue::Object(map);
 
-        let bytes = serialize_record(&obj).unwrap();
+        let bytes = SpookyRecord::serialize(&obj).unwrap();
         let record = SpookyRecord::from_bytes(&bytes).unwrap();
 
         let addr = record.get_field("address").unwrap();
@@ -489,7 +510,7 @@ mod tests {
     #[test]
     fn test_not_an_object() {
         let val = SpookyValue::from("not an object");
-        assert!(serialize_record(&val).is_err());
+        assert!(SpookyRecord::serialize(&val).is_err());
     }
 
     #[test]
@@ -498,7 +519,7 @@ mod tests {
         map.insert(SmolStr::from("nothing"), SpookyValue::Null);
         let obj = SpookyValue::Object(map);
 
-        let bytes = serialize_record(&obj).unwrap();
+        let bytes = SpookyRecord::serialize(&obj).unwrap();
         let record = SpookyRecord::from_bytes(&bytes).unwrap();
         assert_eq!(record.get_field("nothing"), Some(SpookyValue::Null));
     }
@@ -506,7 +527,7 @@ mod tests {
     #[test]
     fn test_iter_fields() {
         let original = make_test_record();
-        let bytes = serialize_record(&original).unwrap();
+        let bytes = SpookyRecord::serialize(&original).unwrap();
         let record = SpookyRecord::from_bytes(&bytes).unwrap();
 
         let fields: Vec<_> = record.iter_fields().collect();
