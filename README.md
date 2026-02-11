@@ -124,52 +124,103 @@ pub enum SpookyValue {
 
 ## Benchmarks
 
-Measured with [Criterion.rs](https://github.com/bheisler/criterion.rs) on a 12-field record with nested objects, arrays, and all value types.
+Measured with [Criterion.rs](https://github.com/bheisler/criterion.rs).
+
+### Test Data
+
+The benchmark uses a **341-byte CBOR payload** with 12 top-level fields covering every supported type:
+
+```json
+{
+  "id": "user:abc123",           // string
+  "name": "Alice",               // string
+  "age": 28,                     // i64
+  "count": 1000,                 // u64
+  "score": 99.5,                 // f64
+  "active": true,                // bool
+  "deleted": false,              // bool
+  "metadata": null,              // null
+  "tags": ["developer", "rust", "database"],                 // array of strings
+  "profile": {                                                // nested object (3 levels deep)
+    "bio": "Software engineer",
+    "avatar": "https://example.com/avatar.jpg",
+    "settings": {
+      "theme": "dark",
+      "notifications": true,
+      "privacy": { "public": false, "level": 3 }
+    }
+  },
+  "history": [                                                // array of objects
+    {"action": "login", "timestamp": 1234567890},
+    {"action": "update", "timestamp": 1234567900}
+  ],
+  "mixed_array": [42, "text", true, {"nested": "value"}]     // mixed-type array
+}
+```
+
+| Format | Size |
+|---|---|
+| CBOR input | **341 bytes** |
+| SpookyRecord binary | **~580 bytes** (header + sorted index + field data) |
 
 ### Creating Records
 
-| Operation | Median | Description |
+| Operation | Median | Throughput |
 |---|---|---|
-| `SpookyRecord::serialize` | **6.31 µs** | Full CBOR → binary pipeline |
-| `SpookyRecordMut::from_spooky_value` | **6.24 µs** | Full CBOR → mutable record |
-| `SpookyRecordMut::new_empty` | **17.18 ns** | Empty record allocation |
-| `SpookyRecordMut::from_vec` | **41.21 ns** | Wrap existing buffer |
+| `SpookyRecord::serialize` | **6.31 µs** | ~158K records/sec |
+| `SpookyRecordMut::from_spooky_value` | **6.24 µs** | ~160K records/sec |
+| `SpookyRecordMut::new_empty` | **17.18 ns** | ~58.2M records/sec |
+| `SpookyRecordMut::from_vec` | **41.21 ns** | ~24.3M records/sec |
 
 ### Reading Values
 
-| Operation | Median | Allocs |
-|---|---|---|
-| `SpookyRecord::get_str` | **10.60 ns** | 0 |
-| `SpookyRecord::get_i64` | **10.62 ns** | 0 |
-| `SpookyRecord::get_bool` | **9.84 ns** | 0 |
-| `SpookyRecord::get_field` | **30.92 ns** | 1 |
-| `SpookyRecordMut::get_str` | **9.53 ns** | 0 |
-| `SpookyRecordMut::get_i64` | **9.02 ns** | 0 |
-| `SpookyRecordMut::get_u64` | **9.08 ns** | 0 |
-| `SpookyRecordMut::get_f64` | **11.97 ns** | 0 |
-| `SpookyRecordMut::get_bool` | **9.10 ns** | 0 |
-| `SpookyRecordMut::get_field` | **31.72 ns** | 1 |
+| Operation | Median | Throughput | Allocs |
+|---|---|---|---|
+| `SpookyRecord::get_str` | **10.60 ns** | ~94.3M reads/sec | 0 |
+| `SpookyRecord::get_i64` | **10.62 ns** | ~94.2M reads/sec | 0 |
+| `SpookyRecord::get_bool` | **9.84 ns** | ~101.7M reads/sec | 0 |
+| `SpookyRecord::get_field` | **30.92 ns** | ~32.3M reads/sec | 1 |
+| `SpookyRecordMut::get_str` | **9.53 ns** | ~104.9M reads/sec | 0 |
+| `SpookyRecordMut::get_i64` | **9.02 ns** | ~110.9M reads/sec | 0 |
+| `SpookyRecordMut::get_u64` | **9.08 ns** | ~110.1M reads/sec | 0 |
+| `SpookyRecordMut::get_f64` | **11.97 ns** | ~83.6M reads/sec | 0 |
+| `SpookyRecordMut::get_bool` | **9.10 ns** | ~109.9M reads/sec | 0 |
+| `SpookyRecordMut::get_field` | **31.72 ns** | ~31.5M reads/sec | 1 |
 
 ### Setting Values
 
-| Operation | Median | Description |
-|---|---|---|
-| `set_i64` | **6.44 ns** | In-place overwrite |
-| `set_u64` | **8.46 ns** | In-place overwrite |
-| `set_f64` | **6.53 ns** | In-place overwrite |
-| `set_bool` | **8.16 ns** | In-place overwrite |
-| `set_str` (same len) | **13.17 ns** | In-place overwrite |
-| `set_str` (diff len) | **27.88 ns** | Splice + fixup |
-| `set_str_exact` | **11.82 ns** | Same-length guaranteed |
-| `set_field` | **26.26 ns** | Generic path |
-| `set_null` | **10.07 ns** | In-place overwrite |
+| Operation | Median | Throughput | Description |
+|---|---|---|---|
+| `set_i64` | **6.44 ns** | ~155.3M writes/sec | In-place overwrite |
+| `set_u64` | **8.46 ns** | ~118.2M writes/sec | In-place overwrite |
+| `set_f64` | **6.53 ns** | ~153.2M writes/sec | In-place overwrite |
+| `set_bool` | **8.16 ns** | ~122.5M writes/sec | In-place overwrite |
+| `set_str` (same len) | **13.17 ns** | ~75.9M writes/sec | In-place overwrite |
+| `set_str` (diff len) | **27.88 ns** | ~35.9M writes/sec | Splice + fixup |
+| `set_str_exact` | **11.82 ns** | ~84.6M writes/sec | Same-length guaranteed |
+| `set_field` | **26.26 ns** | ~38.1M writes/sec | Generic path |
+| `set_null` | **10.07 ns** | ~99.3M writes/sec | In-place overwrite |
 
 ### Field Migration
 
-| Operation | Median | Description |
-|---|---|---|
-| `add_field` | **191.18 ns** | Rebuild with sorted insertion |
-| `remove_field` | **146.28 ns** | Rebuild without field |
+| Operation | Median | Throughput | Description |
+|---|---|---|---|
+| `add_field` | **191.18 ns** | ~5.2M ops/sec | Rebuild with sorted insertion |
+| `remove_field` | **146.28 ns** | ~6.8M ops/sec | Rebuild without field |
+
+### Throughput Summary
+
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Operation          │ Speed           │ Category             │
+  ├────────────────────┼─────────────────┼──────────────────────┤
+  │ Typed reads        │ ~94-111M ops/s  │ Zero-copy, 0 allocs  │
+  │ In-place sets      │ ~118-155M ops/s │ Zero-alloc overwrites│
+  │ String splice      │ ~36-85M ops/s   │ Buffer resize        │
+  │ Add/Remove field   │ ~5-7M ops/s     │ Full rebuild         │
+  │ Full serialize     │ ~158-160K recs/s│ CBOR parse + layout  │
+  └─────────────────────────────────────────────────────────────┘
+```
 
 ### Run Benchmarks
 
