@@ -1,7 +1,8 @@
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use smol_str::SmolStr;
+use std::convert::TryFrom;
 use std::hash::BuildHasherDefault;
 
 pub type FastMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -169,12 +170,12 @@ impl From<String> for SpookyValue {
     }
 }
 
-impl From<Value> for SpookyValue {
-    fn from(v: Value) -> Self {
+impl From<serde_json::Value> for SpookyValue {
+    fn from(v: serde_json::Value) -> Self {
         match v {
-            Value::Null => SpookyValue::Null,
-            Value::Bool(b) => SpookyValue::Bool(b),
-            Value::Number(n) => {
+            serde_json::Value::Null => SpookyValue::Null,
+            serde_json::Value::Bool(b) => SpookyValue::Bool(b),
+            serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     SpookyValue::Number(SpookyNumber::I64(i))
                 } else if let Some(u) = n.as_u64() {
@@ -183,11 +184,11 @@ impl From<Value> for SpookyValue {
                     SpookyValue::Number(SpookyNumber::F64(n.as_f64().unwrap_or(0.0)))
                 }
             }
-            Value::String(s) => SpookyValue::Str(SmolStr::from(s)),
-            Value::Array(arr) => {
+            serde_json::Value::String(s) => SpookyValue::Str(SmolStr::from(s)),
+            serde_json::Value::Array(arr) => {
                 SpookyValue::Array(arr.into_iter().map(SpookyValue::from).collect())
             }
-            Value::Object(obj) => SpookyValue::Object(
+            serde_json::Value::Object(obj) => SpookyValue::Object(
                 obj.into_iter()
                     .map(|(k, v)| (SmolStr::from(k), SpookyValue::from(v)))
                     .collect(),
@@ -196,19 +197,85 @@ impl From<Value> for SpookyValue {
     }
 }
 
-impl From<SpookyValue> for Value {
+impl From<ciborium::Value> for SpookyValue {
+    fn from(v: ciborium::Value) -> Self {
+        match v {
+            ciborium::Value::Null => SpookyValue::Null,
+            ciborium::Value::Bool(b) => SpookyValue::Bool(b),
+            ciborium::Value::Integer(i) => {
+                if let Ok(val_i64) = i64::try_from(i) {
+                    SpookyValue::Number(SpookyNumber::I64(val_i64))
+                } else if let Ok(val_u64) = u64::try_from(i) {
+                    SpookyValue::Number(SpookyNumber::U64(val_u64))
+                } else {
+                    let val_huge = i128::try_from(i).unwrap_or(0);
+                    SpookyValue::Number(SpookyNumber::F64(val_huge as f64))
+                }
+            }
+            ciborium::Value::Float(f) => SpookyValue::Number(SpookyNumber::F64(f)),
+            ciborium::Value::Text(s) => SpookyValue::Str(SmolStr::from(s)),
+            ciborium::Value::Array(arr) => {
+                SpookyValue::Array(arr.into_iter().map(SpookyValue::from).collect())
+            }
+            ciborium::Value::Map(map) => SpookyValue::Object(
+                map.into_iter()
+                    .map(|(k, v)| {
+                        let key_str = match k {
+                            ciborium::value::Value::Text(s) => SmolStr::from(s),
+                            ciborium::value::Value::Integer(i) => {
+                                let val = i128::try_from(i).unwrap_or(0);
+                                SmolStr::from(val.to_string())
+                            }
+                            other => SmolStr::from(format!("{:?}", other)),
+                        };
+                        (key_str, SpookyValue::from(v))
+                    })
+                    .collect(),
+            ),
+            // Covers Bytes, Tag, and any future ciborium variants
+            _ => SpookyValue::Null,
+        }
+    }
+}
+
+impl From<SpookyValue> for ciborium::Value {
     fn from(val: SpookyValue) -> Self {
         match val {
-            SpookyValue::Null => Value::Null,
-            SpookyValue::Bool(b) => Value::Bool(b),
+            SpookyValue::Null => ciborium::Value::Null,
+            SpookyValue::Bool(b) => ciborium::Value::Bool(b),
+            SpookyValue::Number(n) => match n {
+                SpookyNumber::I64(i) => ciborium::Value::Integer(i.into()),
+                SpookyNumber::U64(u) => ciborium::Value::Integer(u.into()),
+                SpookyNumber::F64(f) => ciborium::Value::Float(f),
+            },
+            SpookyValue::Str(s) => ciborium::Value::Text(s.to_string()),
+            SpookyValue::Array(arr) => {
+                ciborium::Value::Array(arr.into_iter().map(|v| v.into()).collect())
+            }
+            SpookyValue::Object(obj) => ciborium::Value::Map(
+                obj.into_iter()
+                    .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v.into()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl From<SpookyValue> for serde_json::Value {
+    fn from(val: SpookyValue) -> Self {
+        match val {
+            SpookyValue::Null => serde_json::Value::Null,
+            SpookyValue::Bool(b) => serde_json::Value::Bool(b),
             SpookyValue::Number(n) => match n {
                 SpookyNumber::I64(i) => json!(i),
                 SpookyNumber::U64(u) => json!(u),
                 SpookyNumber::F64(f) => json!(f),
             },
-            SpookyValue::Str(s) => Value::String(s.to_string()),
-            SpookyValue::Array(arr) => Value::Array(arr.into_iter().map(|v| v.into()).collect()),
-            SpookyValue::Object(obj) => Value::Object(
+            SpookyValue::Str(s) => serde_json::Value::String(s.to_string()),
+            SpookyValue::Array(arr) => {
+                serde_json::Value::Array(arr.into_iter().map(|v| v.into()).collect())
+            }
+            SpookyValue::Object(obj) => serde_json::Value::Object(
                 obj.into_iter()
                     .map(|(k, v)| (k.to_string(), v.into()))
                     .collect(),
