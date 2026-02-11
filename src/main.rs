@@ -1,4 +1,5 @@
 mod spooky_record;
+mod spooky_record_mut;
 mod spooky_value;
 
 use spooky_record::serialize_record;
@@ -54,4 +55,25 @@ fn main() {
             field.data.len()
         );
     }
+
+    println!("\n=== MUTATE PATH: Zero-alloc updates ===\n");
+
+    // Step 4: Create mutable record from the same binary
+    // Note: We clone binary because we used it immutably above.
+    let mut rec_mut = spooky_record_mut::SpookyRecordMut::from_vec(binary.clone()).unwrap();
+
+    // Modify existing field (same type, same size -> fast path)
+    rec_mut.set_i64("age", 31).unwrap();
+    println!("Updated age: {:?}", rec_mut.get_i64("age"));
+
+    // Modify string (different size -> splice path)
+    // "Alice" -> "Alice Modified"
+    rec_mut.set_str("name", "Alice Modified").unwrap();
+    println!("Updated name: {:?}", rec_mut.get_str("name"));
+
+    // Add new field
+    rec_mut.add_field("new_field", &SpookyValue::from(12345u64)).unwrap();
+    println!("Added field 'new_field': {:?}", rec_mut.get_u64("new_field"));
+
+    println!("Final size: {} bytes", rec_mut.byte_len());
 }
