@@ -1,13 +1,15 @@
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 use smol_str::SmolStr;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
+use std::hash::{Hash, Hasher};
 
 pub type FastMap<K, V> = BTreeMap<K, V>;
 
 // ─── SpookyNumber ───────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 pub enum SpookyNumber {
     I64(i64),
     U64(u64),
@@ -24,7 +26,67 @@ impl std::fmt::Debug for SpookyNumber {
     }
 }
 
+/// Canonical total ordering for f64:
+///   NaN < -Inf < ... < -0 == +0 < ... < +Inf
+/// This is required for deterministic ZSet operations.
+fn canonical_f64_cmp(a: f64, b: f64) -> Ordering {
+    a.total_cmp(&b)
+}
+
+fn canonical_f64_hash<H: Hasher>(f: f64, state: &mut H) {
+    // Normalize -0.0 to +0.0 for hashing consistency
+    if f == 0.0 {
+        0.0_f64.to_bits().hash(state);
+    } else {
+        f.to_bits().hash(state);
+    }
+}
+
+impl PartialEq for SpookyNumber {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp_canonical(other) == Ordering::Equal
+    }
+}
+
+impl Eq for SpookyNumber {}
+
+impl PartialOrd for SpookyNumber {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp_canonical(other))
+    }
+}
+
+impl Ord for SpookyNumber {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.cmp_canonical(other)
+    }
+}
+
+impl Hash for SpookyNumber {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Promote everything to f64 for cross-variant consistency:
+        // I64(1) and F64(1.0) should hash the same.
+        let f = self.as_f64();
+        canonical_f64_hash(f, state);
+    }
+}
+
 impl SpookyNumber {
+    /// Total ordering across all numeric variants.
+    /// Compares via f64 promotion with canonical NaN/zero handling.
+    #[inline]
+    fn cmp_canonical(&self, other: &Self) -> Ordering {
+        // Fast path: same variant, integer types
+        match (self, other) {
+            (SpookyNumber::I64(a), SpookyNumber::I64(b)) => a.cmp(b),
+            (SpookyNumber::U64(a), SpookyNumber::U64(b)) => a.cmp(b),
+            _ => canonical_f64_cmp(self.as_f64(), other.as_f64()),
+        }
+    }
+
+    #[inline]
     pub fn as_f64(self) -> f64 {
         match self {
             SpookyNumber::I64(i) => i as f64,
@@ -33,6 +95,7 @@ impl SpookyNumber {
         }
     }
 
+    #[inline]
     pub fn as_i64(self) -> Option<i64> {
         match self {
             SpookyNumber::I64(i) => Some(i),
@@ -47,6 +110,7 @@ impl SpookyNumber {
         }
     }
 
+    #[inline]
     pub fn as_u64(self) -> Option<u64> {
         match self {
             SpookyNumber::U64(u) => Some(u),
@@ -64,7 +128,7 @@ impl SpookyNumber {
 
 // ─── SpookyValue ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum SpookyValue {
     Null,
     Bool(bool),
@@ -75,12 +139,90 @@ pub enum SpookyValue {
 }
 
 impl Default for SpookyValue {
+    #[inline]
     fn default() -> Self {
         SpookyValue::Null
     }
 }
 
+// ─── Eq / Ord / Hash (required for ZSet keys) ──────────────────────────────
+
+impl PartialEq for SpookyValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for SpookyValue {}
+
+impl PartialOrd for SpookyValue {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SpookyValue {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Discriminant ordering: Null < Bool < Number < Str < Array < Object
+        let disc = |v: &SpookyValue| -> u8 {
+            match v {
+                SpookyValue::Null => 0,
+                SpookyValue::Bool(_) => 1,
+                SpookyValue::Number(_) => 2,
+                SpookyValue::Str(_) => 3,
+                SpookyValue::Array(_) => 4,
+                SpookyValue::Object(_) => 5,
+            }
+        };
+
+        let da = disc(self);
+        let db = disc(other);
+        if da != db {
+            return da.cmp(&db);
+        }
+
+        match (self, other) {
+            (SpookyValue::Null, SpookyValue::Null) => Ordering::Equal,
+            (SpookyValue::Bool(a), SpookyValue::Bool(b)) => a.cmp(b),
+            (SpookyValue::Number(a), SpookyValue::Number(b)) => a.cmp(b),
+            (SpookyValue::Str(a), SpookyValue::Str(b)) => a.cmp(b),
+            (SpookyValue::Array(a), SpookyValue::Array(b)) => a.cmp(b),
+            (SpookyValue::Object(a), SpookyValue::Object(b)) => a.cmp(b),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Hash for SpookyValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            SpookyValue::Null => {}
+            SpookyValue::Bool(b) => b.hash(state),
+            SpookyValue::Number(n) => n.hash(state),
+            SpookyValue::Str(s) => s.hash(state),
+            SpookyValue::Array(arr) => {
+                arr.len().hash(state);
+                for v in arr {
+                    v.hash(state);
+                }
+            }
+            SpookyValue::Object(map) => {
+                map.len().hash(state);
+                for (k, v) in map {
+                    k.hash(state);
+                    v.hash(state);
+                }
+            }
+        }
+    }
+}
+
+// ─── Accessors ──────────────────────────────────────────────────────────────
+
 impl SpookyValue {
+    #[inline]
     pub fn as_str(&self) -> Option<&str> {
         match self {
             SpookyValue::Str(s) => Some(s.as_str()),
@@ -88,6 +230,7 @@ impl SpookyValue {
         }
     }
 
+    #[inline]
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             SpookyValue::Number(n) => Some(n.as_f64()),
@@ -95,6 +238,7 @@ impl SpookyValue {
         }
     }
 
+    #[inline]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             SpookyValue::Number(n) => n.as_i64(),
@@ -102,6 +246,7 @@ impl SpookyValue {
         }
     }
 
+    #[inline]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             SpookyValue::Number(n) => n.as_u64(),
@@ -109,6 +254,7 @@ impl SpookyValue {
         }
     }
 
+    #[inline]
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             SpookyValue::Bool(b) => Some(*b),
@@ -116,6 +262,7 @@ impl SpookyValue {
         }
     }
 
+    #[inline]
     pub fn as_object(&self) -> Option<&FastMap<SmolStr, SpookyValue>> {
         match self {
             SpookyValue::Object(map) => Some(map),
@@ -123,6 +270,16 @@ impl SpookyValue {
         }
     }
 
+    /// Mutable object access — avoids clone-modify-replace patterns.
+    #[inline]
+    pub fn as_object_mut(&mut self) -> Option<&mut FastMap<SmolStr, SpookyValue>> {
+        match self {
+            SpookyValue::Object(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn as_array(&self) -> Option<&Vec<SpookyValue>> {
         match self {
             SpookyValue::Array(arr) => Some(arr),
@@ -130,18 +287,61 @@ impl SpookyValue {
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<&SpookyValue> {
-        self.as_object()?.get(&SmolStr::new(key))
+    /// Mutable array access — avoids clone-modify-replace patterns.
+    #[inline]
+    pub fn as_array_mut(&mut self) -> Option<&mut Vec<SpookyValue>> {
+        match self {
+            SpookyValue::Array(arr) => Some(arr),
+            _ => None,
+        }
     }
 
+    /// Field access by key. Uses BTreeMap's native lookup — no SmolStr allocation
+    /// thanks to SmolStr implementing Borrow<str>.
+    #[inline]
+    pub fn get(&self, key: &str) -> Option<&SpookyValue> {
+        // SmolStr implements Borrow<str>, and BTreeMap::get accepts Q where K: Borrow<Q>.
+        // However, BTreeMap<SmolStr, V>::get(&str) requires Ord consistency.
+        // SmolStr's Ord delegates to str's Ord, so this is safe.
+        self.as_object()?.get(key)
+    }
+
+    /// Mutable field access by key.
+    #[inline]
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut SpookyValue> {
+        self.as_object_mut()?.get_mut(key)
+    }
+
+    #[inline]
     pub fn is_null(&self) -> bool {
         matches!(self, SpookyValue::Null)
     }
+
+    #[inline]
+    pub fn is_object(&self) -> bool {
+        matches!(self, SpookyValue::Object(_))
+    }
+
+    #[inline]
+    pub fn is_array(&self) -> bool {
+        matches!(self, SpookyValue::Array(_))
+    }
+
+    #[inline]
+    pub fn is_string(&self) -> bool {
+        matches!(self, SpookyValue::Str(_))
+    }
+
+    #[inline]
+    pub fn is_number(&self) -> bool {
+        matches!(self, SpookyValue::Number(_))
+    }
 }
 
-// ─── Serialize (for ciborium::into_writer on nested types) ──────────────────
+// ─── Serialize ──────────────────────────────────────────────────────────────
 
 impl Serialize for SpookyValue {
+    #[inline]
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             SpookyValue::Null => serializer.serialize_none(),
@@ -173,38 +373,65 @@ impl Serialize for SpookyValue {
 // ─── From impls ─────────────────────────────────────────────────────────────
 
 impl From<f64> for SpookyValue {
+    #[inline]
     fn from(n: f64) -> Self {
         SpookyValue::Number(SpookyNumber::F64(n))
     }
 }
 
 impl From<i64> for SpookyValue {
+    #[inline]
     fn from(n: i64) -> Self {
         SpookyValue::Number(SpookyNumber::I64(n))
     }
 }
 
+impl From<i32> for SpookyValue {
+    #[inline]
+    fn from(n: i32) -> Self {
+        SpookyValue::Number(SpookyNumber::I64(n as i64))
+    }
+}
+
 impl From<u64> for SpookyValue {
+    #[inline]
     fn from(n: u64) -> Self {
         SpookyValue::Number(SpookyNumber::U64(n))
     }
 }
 
+impl From<u32> for SpookyValue {
+    #[inline]
+    fn from(n: u32) -> Self {
+        SpookyValue::Number(SpookyNumber::U64(n as u64))
+    }
+}
+
 impl From<bool> for SpookyValue {
+    #[inline]
     fn from(b: bool) -> Self {
         SpookyValue::Bool(b)
     }
 }
 
 impl From<&str> for SpookyValue {
+    #[inline]
     fn from(s: &str) -> Self {
         SpookyValue::Str(SmolStr::from(s))
     }
 }
 
 impl From<String> for SpookyValue {
+    #[inline]
     fn from(s: String) -> Self {
         SpookyValue::Str(SmolStr::from(s))
+    }
+}
+
+impl From<SmolStr> for SpookyValue {
+    #[inline]
+    fn from(s: SmolStr) -> Self {
+        SpookyValue::Str(s)
     }
 }
 
@@ -329,7 +556,6 @@ impl From<SpookyValue> for serde_json::Value {
 
 #[macro_export]
 macro_rules! spooky_obj {
-    // Einstiegspunkt für Objekte
     ({ $($key:expr => $val:tt),* $(,)? }) => {{
         let mut map = FastMap::default();
         $(
@@ -341,12 +567,10 @@ macro_rules! spooky_obj {
         SpookyValue::Object(map)
     }};
 
-    // Rekursion für verschachtelte Objekte
     (@value { $($inner:tt)* }) => {
         spooky_obj!({ $($inner)* })
     };
 
-    // Fallback für alles andere (Literale oder fertige SpookyValues)
     (@value $val:expr) => {
         $val
     };

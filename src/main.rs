@@ -4,8 +4,6 @@ mod spooky_value;
 use spooky_record::serialize_record;
 use spooky_value::SpookyValue;
 
-use crate::spooky_record::SpookyRecord;
-
 const TEST_CBOR: &[u8] = &[
     166, 99, 97, 103, 101, 24, 28, 106, 99, 114, 101, 97, 116, 101, 100, 95, 97, 116, 116, 50, 48,
     50, 52, 45, 48, 49, 45, 49, 53, 84, 49, 48, 58, 51, 48, 58, 48, 48, 90, 101, 101, 109, 97, 105,
@@ -25,7 +23,7 @@ fn main() {
     println!("Parsed SpookyValue:\n{:#?}\n", spooky);
 
     // Step 2: Serialize to hybrid binary format
-    let binary = serialize_record(&spooky);
+    let binary = serialize_record(&spooky).expect("serialize_record failed");
     println!("Hybrid binary: {} bytes\n", binary.len());
 
     println!("=== READ PATH: Zero-copy field access ===\n");
