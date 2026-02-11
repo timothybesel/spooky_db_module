@@ -1,80 +1,59 @@
-//use redb::{Database, Error, ReadableDatabase, ReadableTable, TableDefinition};
+mod spooky_record;
 mod spooky_value;
 
-use ciborium;
-use serde_json::{Result, Value};
-use spooky_value::{SpookyNumber, SpookyValue};
+use spooky_record::serialize_record;
+use spooky_value::SpookyValue;
 
-const TEST_JSON: &str = r#"{
-  "age": 28,
-  "id": "user:abc123",
-  "name": "Alice",
-  "email": "alice@example.com",
-  "profile": { "bio": "Developer", "avatar": "https://..." },
-  "created_at": "2024-01-15T10:30:00Z"
-}"#;
+use crate::spooky_record::SpookyRecord;
 
-/// Header at the start of every hybrid record
-#[repr(C, packed)]
-struct RecordHeader {
-    field_count: u32,
-    _reserved: u32,
-}
+const TEST_CBOR: &[u8] = &[
+    166, 99, 97, 103, 101, 24, 28, 106, 99, 114, 101, 97, 116, 101, 100, 95, 97, 116, 116, 50, 48,
+    50, 52, 45, 48, 49, 45, 49, 53, 84, 49, 48, 58, 51, 48, 58, 48, 48, 90, 101, 101, 109, 97, 105,
+    108, 113, 97, 108, 105, 99, 101, 64, 101, 120, 97, 109, 112, 108, 101, 46, 99, 111, 109, 98,
+    105, 100, 107, 117, 115, 101, 114, 58, 97, 98, 99, 49, 50, 51, 100, 110, 97, 109, 101, 101, 65,
+    108, 105, 99, 101, 103, 112, 114, 111, 102, 105, 108, 101, 162, 102, 97, 118, 97, 116, 97, 114,
+    107, 104, 116, 116, 112, 115, 58, 47, 47, 46, 46, 46, 99, 98, 105, 111, 105, 68, 101, 118, 101,
+    108, 111, 112, 101, 114,
+];
 
-/// Field index entry (fixed size for easy offset calculation)
-#[repr(C, packed)]
-struct FieldIndexEntry {
-    name_hash: u64,
-    data_offset: u32,
-    data_length: u32,
-    type_tag: u8,
-    _padding: [u8; 3], // Align to 16 bytes
-}
+fn main() {
+    println!("=== WRITE PATH: CBOR → SpookyValue → Hybrid Binary ===\n");
 
-/// Zero-copy record reader
-pub struct HybridRecord<'a> {
-    bytes: &'a [u8],
-    header: &'a RecordHeader,
-    index: &'a [FieldIndexEntry],
-}
+    // Step 1: Parse CBOR bytes (simulates SurrealDB input)
+    let cbor_val: ciborium::Value = ciborium::from_reader(TEST_CBOR).unwrap();
+    let spooky = SpookyValue::from(cbor_val);
+    println!("Parsed SpookyValue:\n{:#?}\n", spooky);
 
-fn serielize_data(data: &SpookyValue) {
-    let fields: Vec<(&str, &SpookyValue)> = match data {
-        SpookyValue::Object(map) => map.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-        _ => panic!("Can only serialize objects as records"),
-    };
+    // Step 2: Serialize to hybrid binary format
+    let binary = serialize_record(&spooky);
+    println!("Hybrid binary: {} bytes\n", binary.len());
 
-    let field_count = fields.len() as u32;
-    let header_size = std::mem::size_of::<RecordHeader>();
-    let index_size = field_count as usize * std::mem::size_of::<FieldIndexEntry>();
-    let _data_start = header_size + index_size;
-}
+    println!("=== READ PATH: Zero-copy field access ===\n");
 
-fn serialize_field_value(value: &SpookyValue) -> (Vec<u8>, u8) {
-    match value {
-        SpookyValue::Null => (vec![], 0),
-        SpookyValue::Bool(b) => (vec![if *b { 1 } else { 0 }], 1),
-        SpookyValue::Number(n) => match n {
-            SpookyNumber::I64(i) => (i.to_le_bytes().to_vec(), 2),
-            SpookyNumber::F64(f) => (f.to_le_bytes().to_vec(), 3),
-            // ACHTUNG: Du hattest hier Tag 4, aber Tag 4 ist schon Bool!
-            // Ich habe es auf 6 geändert.
-            SpookyNumber::U64(u) => (u.to_le_bytes().to_vec(), 4),
-        },
-        SpookyValue::Str(s) => (s.as_bytes().to_vec(), 5),
+    // Step 3: Wrap binary as HybridRecord (zero-copy, no parsing)
+    let record = spooky_record::SpookyRecord::from_bytes(&binary).unwrap();
+    println!("Field count: {}\n", record.field_count());
 
-        // Der neue Teil:
-        SpookyValue::Array(_) | SpookyValue::Object(_) => {
-            let mut buf = Vec::new();
-            ciborium::into_writer(value, &mut buf).expect("Failed to serialize complex type");
-            (buf, 6)
-        }
+    // Typed accessors — no SpookyValue allocation
+    println!("--- Typed zero-alloc reads ---");
+    println!("  age  (i64): {:?}", record.get_i64("age"));
+    println!("  name (str): {:?}", record.get_str("name"));
+    println!("  email(str): {:?}", record.get_str("email"));
+    println!("  id   (str): {:?}", record.get_str("id"));
+
+    // SpookyValue accessor — allocates only for the requested field
+    println!("\n--- Selective SpookyValue reads ---");
+    println!("  profile: {:#?}", record.get_field("profile"));
+    println!("  age:     {:#?}", record.get_field("age"));
+
+    // Iterate all raw fields (zero-copy)
+    println!("\n--- Raw field iteration ---");
+    for field in record.iter_fields() {
+        println!(
+            "  hash={:016x} tag={} len={}",
+            field.name_hash,
+            field.type_tag,
+            field.data.len()
+        );
     }
-}
-
-fn main() -> Result<()> {
-    let res: Value = serde_json::from_str(TEST_JSON)?;
-    let spooky_res = SpookyValue::from(res);
-    serielize_data(&spooky_res);
-    Ok(())
 }
