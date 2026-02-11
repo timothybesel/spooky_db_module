@@ -7,41 +7,31 @@ use crate::spooky_value::{FastMap, SpookyNumber, SpookyValue};
 
 #[derive(Debug)]
 pub enum RecordError {
-    /// Field not found in the record.
-    FieldNotFound,
-    /// Attempted a typed setter on a field with a different type tag.
-    TypeMismatch { expected: u8, actual: u8 },
-    /// String length doesn't match for set_str_exact.
-    LengthMismatch { expected: usize, actual: usize },
-    /// The buffer is malformed or too small.
     InvalidBuffer,
-    /// CBOR serialization failed for a nested value.
-    CborError(String),
-    /// Field already exists (for add_field).
+    FieldNotFound,
+    TypeMismatch { expected: u8, actual: u8 },
+    LengthMismatch { expected: usize, actual: usize },
     FieldExists,
+    CborError(String),
 }
 
 impl std::fmt::Display for RecordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RecordError::FieldNotFound => write!(f, "field not found"),
+            RecordError::InvalidBuffer => write!(f, "Invalid buffer structure"),
+            RecordError::FieldNotFound => write!(f, "Field not found"),
             RecordError::TypeMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "type mismatch: expected tag {}, got {}",
-                    expected, actual
-                )
+                write!(f, "Type mismatch: expected {}, got {}", expected, actual)
             }
             RecordError::LengthMismatch { expected, actual } => {
                 write!(
                     f,
-                    "length mismatch: expected {} bytes, got {}",
+                    "Length mismatch: expected {}, got {}",
                     expected, actual
                 )
             }
-            RecordError::InvalidBuffer => write!(f, "invalid or corrupt record buffer"),
-            RecordError::CborError(e) => write!(f, "CBOR error: {}", e),
-            RecordError::FieldExists => write!(f, "field already exists"),
+            RecordError::FieldExists => write!(f, "Field already exists"),
+            RecordError::CborError(msg) => write!(f, "CBOR error: {}", msg),
         }
     }
 }
@@ -54,9 +44,9 @@ pub const TAG_NULL: u8 = 0;
 pub const TAG_BOOL: u8 = 1;
 pub const TAG_I64: u8 = 2;
 pub const TAG_F64: u8 = 3;
-pub const TAG_U64: u8 = 4;
-pub const TAG_STR: u8 = 5;
-pub const TAG_NESTED_CBOR: u8 = 6;
+pub const TAG_STR: u8 = 4;
+pub const TAG_NESTED_CBOR: u8 = 5; // Array or Object
+pub const TAG_U64: u8 = 6; // Extension
 
 // ─── Binary Layout ──────────────────────────────────────────────────────────
 //
@@ -177,6 +167,7 @@ pub struct FieldRef<'a> {
     pub data: &'a [u8],
 }
 
+#[allow(dead_code)]
 impl<'a> SpookyRecord<'a> {
     /// Wrap a byte slice as a SpookyRecord. No copies, no parsing.
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, RecordError> {

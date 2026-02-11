@@ -1,11 +1,11 @@
-use smol_str::SmolStr;
 use xxhash_rust::xxh64::xxh64;
 
+#[allow(unused_imports)]
 use crate::spooky_record::{
-    FieldRef, HEADER_SIZE, INDEX_ENTRY_SIZE, RecordError, SpookyRecord, TAG_BOOL, TAG_F64, TAG_I64,
-    TAG_NESTED_CBOR, TAG_NULL, TAG_STR, TAG_U64, decode_field, serialize_field,
+    decode_field, serialize_field, FieldRef, RecordError, SpookyRecord, HEADER_SIZE,
+    INDEX_ENTRY_SIZE, TAG_BOOL, TAG_F64, TAG_I64, TAG_STR, TAG_U64,
 };
-use crate::spooky_value::{FastMap, SpookyNumber, SpookyValue};
+use crate::spooky_value::SpookyValue;
 
 // ─── Error ──────────────────────────────────────────────────────────────────
 
@@ -53,6 +53,7 @@ pub struct SpookyRecordMut {
     field_count: u32,
 }
 
+#[allow(dead_code)]
 impl SpookyRecordMut {
     // ════════════════════════════════════════════════════════════════════════
     // Construction
@@ -715,7 +716,9 @@ impl SpookyRecordMut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spooky_record::serialize_record;
+    use crate::spooky_record::{serialize_record, TAG_NULL};
+    use crate::spooky_value::FastMap;
+    use smol_str::SmolStr;
 
     fn make_test_value() -> SpookyValue {
         let mut map = FastMap::new();
