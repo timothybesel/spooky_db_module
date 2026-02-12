@@ -30,9 +30,8 @@ fn main() {
         "mixed_array": [42, "text", true, {"nested": "value"}]
     });
     
-    let cbor_val: ciborium::Value = serde_json::from_value(complex_data).unwrap();
-    let mut buf = Vec::new();
-    ciborium::into_writer(&cbor_val, &mut buf).unwrap();
+    let cbor_val: cbor4ii::core::Value = serde_json::from_value(complex_data).unwrap();
+    let buf = cbor4ii::serde::to_vec(Vec::new(), &cbor_val).unwrap();
     
     // Print as Rust byte array
     print!("const BENCH_CBOR: &[u8] = &[\n    ");

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ciborium = "0.2.2"
+cbor4ii = { version = "1.2.2", features = ["serde1", "use_alloc"] }
 
 redb = "3.1.0"
 rustc-hash = "2.1.1"

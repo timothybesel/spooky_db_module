@@ -49,8 +49,7 @@ fn main() {
     }
 
     // Serialisieren
-    let mut cbor_bytes = Vec::new();
-    ciborium::into_writer(&root_map, &mut cbor_bytes).unwrap();
+    let cbor_bytes = cbor4ii::serde::to_vec(Vec::new(), &root_map).unwrap();
 
     let size_kb = cbor_bytes.len() as f64 / 1024.0;
     println!("CBOR Größe: {} Bytes ({:.2} KB)", cbor_bytes.len(), size_kb);

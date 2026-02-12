@@ -437,35 +437,31 @@ impl From<SmolStr> for SpookyValue {
 
 // ─── From<ciborium::Value> ─────────────────────────────────────────────────
 
-impl From<ciborium::Value> for SpookyValue {
-    fn from(v: ciborium::Value) -> Self {
+impl From<cbor4ii::core::Value> for SpookyValue {
+    fn from(v: cbor4ii::core::Value) -> Self {
         match v {
-            ciborium::Value::Null => SpookyValue::Null,
-            ciborium::Value::Bool(b) => SpookyValue::Bool(b),
-            ciborium::Value::Integer(i) => {
+            cbor4ii::core::Value::Null => SpookyValue::Null,
+            cbor4ii::core::Value::Bool(b) => SpookyValue::Bool(b),
+            cbor4ii::core::Value::Integer(i) => {
                 if let Ok(val) = i64::try_from(i) {
                     SpookyValue::Number(SpookyNumber::I64(val))
                 } else if let Ok(val) = u64::try_from(i) {
                     SpookyValue::Number(SpookyNumber::U64(val))
                 } else {
-                    let val = i128::try_from(i).unwrap_or(0);
-                    SpookyValue::Number(SpookyNumber::F64(val as f64))
+                    SpookyValue::Number(SpookyNumber::F64(i as f64))
                 }
             }
-            ciborium::Value::Float(f) => SpookyValue::Number(SpookyNumber::F64(f)),
-            ciborium::Value::Text(s) => SpookyValue::Str(SmolStr::from(s)),
-            ciborium::Value::Array(arr) => {
+            cbor4ii::core::Value::Float(f) => SpookyValue::Number(SpookyNumber::F64(f)),
+            cbor4ii::core::Value::Text(s) => SpookyValue::Str(SmolStr::from(s)),
+            cbor4ii::core::Value::Array(arr) => {
                 SpookyValue::Array(arr.into_iter().map(SpookyValue::from).collect())
             }
-            ciborium::Value::Map(map) => SpookyValue::Object(
+            cbor4ii::core::Value::Map(map) => SpookyValue::Object(
                 map.into_iter()
                     .map(|(k, v)| {
                         let key = match k {
-                            ciborium::Value::Text(s) => SmolStr::from(s),
-                            ciborium::Value::Integer(i) => {
-                                let val = i128::try_from(i).unwrap_or(0);
-                                SmolStr::from(val.to_string())
-                            }
+                            cbor4ii::core::Value::Text(s) => SmolStr::from(s),
+                            cbor4ii::core::Value::Integer(i) => SmolStr::from(i.to_string()),
                             other => SmolStr::from(format!("{:?}", other)),
                         };
                         (key, SpookyValue::from(v))
@@ -477,25 +473,25 @@ impl From<ciborium::Value> for SpookyValue {
     }
 }
 
-// ─── Into<ciborium::Value> ──────────────────────────────────────────────────
+// ─── Into<cbor4ii::core::Value> ──────────────────────────────────────────────────
 
-impl From<SpookyValue> for ciborium::Value {
+impl From<SpookyValue> for cbor4ii::core::Value {
     fn from(val: SpookyValue) -> Self {
         match val {
-            SpookyValue::Null => ciborium::Value::Null,
-            SpookyValue::Bool(b) => ciborium::Value::Bool(b),
+            SpookyValue::Null => cbor4ii::core::Value::Null,
+            SpookyValue::Bool(b) => cbor4ii::core::Value::Bool(b),
             SpookyValue::Number(n) => match n {
-                SpookyNumber::I64(i) => ciborium::Value::Integer(i.into()),
-                SpookyNumber::U64(u) => ciborium::Value::Integer(u.into()),
-                SpookyNumber::F64(f) => ciborium::Value::Float(f),
+                SpookyNumber::I64(i) => cbor4ii::core::Value::Integer(i as i128),
+                SpookyNumber::U64(u) => cbor4ii::core::Value::Integer(u as i128),
+                SpookyNumber::F64(f) => cbor4ii::core::Value::Float(f),
             },
-            SpookyValue::Str(s) => ciborium::Value::Text(s.to_string()),
+            SpookyValue::Str(s) => cbor4ii::core::Value::Text(s.to_string()),
             SpookyValue::Array(arr) => {
-                ciborium::Value::Array(arr.into_iter().map(|v| v.into()).collect())
+                cbor4ii::core::Value::Array(arr.into_iter().map(|v| v.into()).collect())
             }
-            SpookyValue::Object(obj) => ciborium::Value::Map(
+            SpookyValue::Object(obj) => cbor4ii::core::Value::Map(
                 obj.into_iter()
-                    .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v.into()))
+                    .map(|(k, v)| (cbor4ii::core::Value::Text(k.to_string()), v.into()))
                     .collect(),
             ),
         }
