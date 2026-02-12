@@ -1,6 +1,7 @@
 #[path = "data/cbor_flat_map.rs"]
 pub mod cbor_flat_map;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+use criterion::{Criterion, criterion_group, criterion_main};
 use spooky_db_module::spooky_record::SpookyRecord;
 use spooky_db_module::spooky_record_mut::SpookyRecordMut;
 use spooky_db_module::spooky_value::SpookyValue;
@@ -122,6 +123,8 @@ fn bench_creating_spooky_record(c: &mut Criterion) {
 
 fn bench_reading_values(c: &mut Criterion) {
     let mut group = c.benchmark_group("reading_values");
+    group.sample_size(500);
+    group.measurement_time(std::time::Duration::from_secs(8));
 
     let binary = make_binary();
     let record = SpookyRecord::from_bytes(&binary).unwrap();
@@ -130,45 +133,45 @@ fn bench_reading_values(c: &mut Criterion) {
     // ── SpookyRecord (immutable) getters ──
 
     group.bench_function("SpookyRecord::get_field", |b| {
-        b.iter(|| record.get_field(black_box("name")))
+        b.iter(|| black_box(record.get_field(black_box("name"))))
     });
 
     group.bench_function("SpookyRecord::get_str", |b| {
-        b.iter(|| record.get_str(black_box("name")))
+        b.iter(|| black_box(record.get_str(black_box("name"))))
     });
 
     group.bench_function("SpookyRecord::get_i64", |b| {
-        b.iter(|| record.get_i64(black_box("age")))
+        b.iter(|| black_box(record.get_i64(black_box("age"))))
     });
 
     group.bench_function("SpookyRecord::get_bool", |b| {
-        b.iter(|| record.get_bool(black_box("active")))
+        b.iter(|| black_box(record.get_bool(black_box("active"))))
     });
 
     // ── SpookyRecordMut getters ──
 
     group.bench_function("SpookyRecordMut::get_field", |b| {
-        b.iter(|| mut_record.get_field(black_box("name")))
+        b.iter(|| black_box(mut_record.get_field(black_box("name"))))
     });
 
     group.bench_function("SpookyRecordMut::get_str", |b| {
-        b.iter(|| mut_record.get_str(black_box("name")))
+        b.iter(|| black_box(mut_record.get_str(black_box("name"))))
     });
 
     group.bench_function("SpookyRecordMut::get_i64", |b| {
-        b.iter(|| mut_record.get_i64(black_box("age")))
+        b.iter(|| black_box(mut_record.get_i64(black_box("age"))))
     });
 
     group.bench_function("SpookyRecordMut::get_u64", |b| {
-        b.iter(|| mut_record.get_u64(black_box("age")))
+        b.iter(|| black_box(mut_record.get_u64(black_box("age"))))
     });
 
     group.bench_function("SpookyRecordMut::get_f64", |b| {
-        b.iter(|| mut_record.get_f64(black_box("age")))
+        b.iter(|| black_box(mut_record.get_f64(black_box("age"))))
     });
 
     group.bench_function("SpookyRecordMut::get_bool", |b| {
-        b.iter(|| mut_record.get_bool(black_box("active")))
+        b.iter(|| black_box(mut_record.get_bool(black_box("active"))))
     });
 
     group.finish();
@@ -180,6 +183,8 @@ fn bench_reading_values(c: &mut Criterion) {
 
 fn bench_set_values(c: &mut Criterion) {
     let mut group = c.benchmark_group("set_values");
+    group.sample_size(500);
+    group.measurement_time(std::time::Duration::from_secs(8));
 
     let binary = make_binary();
 
@@ -198,34 +203,32 @@ fn bench_set_values(c: &mut Criterion) {
 
     group.bench_function("set_i64", |b| {
         let mut rec = make_typed_record();
-        b.iter(|| rec.set_i64(black_box("age"), black_box(42)).unwrap())
+        b.iter(|| black_box(rec.set_i64(black_box("age"), black_box(42))))
     });
 
     group.bench_function("set_u64", |b| {
         let mut rec = make_typed_record();
-        b.iter(|| rec.set_u64(black_box("bench_u64"), black_box(42)).unwrap())
+        b.iter(|| black_box(rec.set_u64(black_box("bench_u64"), black_box(42))))
     });
 
     group.bench_function("set_f64", |b| {
         let mut rec = make_typed_record();
         b.iter(|| {
-            rec.set_f64(black_box("bench_f64"), black_box(42.5))
-                .unwrap()
+            black_box(rec.set_f64(black_box("bench_f64"), black_box(42.5)))
         })
     });
 
     group.bench_function("set_bool", |b| {
         let mut rec = make_typed_record();
         b.iter(|| {
-            rec.set_bool(black_box("bench_bool"), black_box(true))
-                .unwrap()
+            black_box(rec.set_bool(black_box("bench_bool"), black_box(true)))
         })
     });
 
     group.bench_function("set_str (same len)", |b| {
         let mut rec = make_typed_record();
         // "Alice" → "Bobby" (5 bytes each)
-        b.iter(|| rec.set_str(black_box("name"), black_box("Bobby")).unwrap())
+        b.iter(|| black_box(rec.set_str(black_box("name"), black_box("Bobby"))))
     });
 
     group.bench_function("set_str (diff len)", |b| {
@@ -236,27 +239,26 @@ fn bench_set_values(c: &mut Criterion) {
         b.iter(|| {
             let val = if toggle { short } else { long };
             toggle = !toggle;
-            rec.set_str(black_box("name"), black_box(val)).unwrap()
+            black_box(rec.set_str(black_box("name"), black_box(val)))
         })
     });
 
     group.bench_function("set_str_exact", |b| {
         let mut rec = make_typed_record();
         b.iter(|| {
-            rec.set_str_exact(black_box("name"), black_box("Bobby"))
-                .unwrap()
+            black_box(rec.set_str_exact(black_box("name"), black_box("Bobby")))
         })
     });
 
     group.bench_function("set_field", |b| {
         let mut rec = make_typed_record();
         let val = SpookyValue::from(99i64);
-        b.iter(|| rec.set_field(black_box("age"), black_box(&val)).unwrap())
+        b.iter(|| black_box(rec.set_field(black_box("age"), black_box(&val))))
     });
 
     group.bench_function("set_null", |b| {
         let mut rec = make_typed_record();
-        b.iter(|| rec.set_null(black_box("age")).unwrap())
+        b.iter(|| black_box(rec.set_null(black_box("age"))))
     });
 
     group.finish();
@@ -304,6 +306,11 @@ fn bench_field_migration(c: &mut Criterion) {
 
 fn bench_fieldslot(c: &mut Criterion) {
     let mut group = c.benchmark_group("fieldslot");
+    // Sub-nanosecond operations need many samples and longer measurement
+    // to reduce noise and avoid measurement overhead dominating.
+    group.sample_size(1000);
+    group.measurement_time(std::time::Duration::from_secs(10));
+    group.warm_up_time(std::time::Duration::from_secs(3));
 
     let binary = make_binary();
     let mut rec = SpookyRecordMut::from_vec(binary.clone()).unwrap();
@@ -315,55 +322,58 @@ fn bench_fieldslot(c: &mut Criterion) {
     let score_slot = rec.resolve("score").unwrap();
 
     // ── Reads ──
+    // black_box on BOTH inputs and return values prevents the compiler
+    // from eliding the work — critical for sub-ns operations.
 
     group.bench_function("get_i64 (by name)", |b| {
-        b.iter(|| rec.get_i64(black_box("age")))
+        b.iter(|| black_box(rec.get_i64(black_box("age"))))
     });
 
     group.bench_function("get_i64_at (slot)", |b| {
-        b.iter(|| rec.get_i64_at(black_box(&age_slot)))
+        b.iter(|| black_box(rec.get_i64_at(black_box(&age_slot))))
     });
 
     group.bench_function("get_str (by name)", |b| {
-        b.iter(|| rec.get_str(black_box("name")))
+        b.iter(|| black_box(rec.get_str(black_box("name"))))
     });
 
     group.bench_function("get_str_at (slot)", |b| {
-        b.iter(|| rec.get_str_at(black_box(&name_slot)))
+        b.iter(|| black_box(rec.get_str_at(black_box(&name_slot))))
     });
 
     group.bench_function("get_bool (by name)", |b| {
-        b.iter(|| rec.get_bool(black_box("active")))
+        b.iter(|| black_box(rec.get_bool(black_box("active"))))
     });
 
     group.bench_function("get_bool_at (slot)", |b| {
-        b.iter(|| rec.get_bool_at(black_box(&active_slot)))
+        b.iter(|| black_box(rec.get_bool_at(black_box(&active_slot))))
     });
 
     group.bench_function("get_f64 (by name)", |b| {
-        b.iter(|| rec.get_f64(black_box("score")))
+        b.iter(|| black_box(rec.get_f64(black_box("score"))))
     });
 
     group.bench_function("get_f64_at (slot)", |b| {
-        b.iter(|| rec.get_f64_at(black_box(&score_slot)))
+        b.iter(|| black_box(rec.get_f64_at(black_box(&score_slot))))
     });
 
     // ── Writes ──
+    // black_box the Result to prevent the compiler from eliding the write.
 
     group.bench_function("set_i64 (by name)", |b| {
-        b.iter(|| rec.set_i64(black_box("age"), black_box(42)).unwrap())
+        b.iter(|| black_box(rec.set_i64(black_box("age"), black_box(42))))
     });
 
     group.bench_function("set_i64_at (slot)", |b| {
-        b.iter(|| rec.set_i64_at(black_box(&age_slot), black_box(42)).unwrap())
+        b.iter(|| black_box(rec.set_i64_at(black_box(&age_slot), black_box(42))))
     });
 
     group.bench_function("set_str_exact (by name)", |b| {
-        b.iter(|| rec.set_str_exact(black_box("name"), black_box("Bobby")).unwrap())
+        b.iter(|| black_box(rec.set_str_exact(black_box("name"), black_box("Bobby"))))
     });
 
     group.bench_function("set_str_at (slot, same len)", |b| {
-        b.iter(|| rec.set_str_at(black_box(&name_slot), black_box("Bobby")).unwrap())
+        b.iter(|| black_box(rec.set_str_at(black_box(&name_slot), black_box("Bobby"))))
     });
 
     group.finish();

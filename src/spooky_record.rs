@@ -72,7 +72,6 @@ pub const INDEX_ENTRY_SIZE: usize = 20; // 8 + 4 + 4 + 1 + 3
 ///
 /// **IMPORTANT**: The index is sorted by name_hash. This is required for
 /// O(log n) binary search in both SpookyRecord and SpookyRecordMut.
-/// O(log n) binary search in both SpookyRecord and SpookyRecordMut.
 
 /// Serialize a single field value into (bytes, type_tag).
 #[inline]

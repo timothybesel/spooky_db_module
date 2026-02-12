@@ -37,6 +37,7 @@ struct IndexMeta {
 /// Staleness is checked via debug assertions.
 #[derive(Debug, Clone, Copy)]
 pub struct FieldSlot {
+    #[allow(dead_code)]
     pub(crate) index_pos: usize,
     pub(crate) data_offset: usize,
     pub(crate) data_length: usize,
