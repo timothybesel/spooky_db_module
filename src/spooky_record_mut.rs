@@ -2,8 +2,8 @@ use xxhash_rust::xxh64::xxh64;
 
 #[allow(unused_imports)]
 use crate::spooky_record::{
-    decode_field, serialize_field, FieldRef, RecordError, SpookyRecord, HEADER_SIZE,
-    INDEX_ENTRY_SIZE, TAG_BOOL, TAG_F64, TAG_I64, TAG_STR, TAG_U64,
+    FieldRef, HEADER_SIZE, INDEX_ENTRY_SIZE, RecordError, SpookyRecord, TAG_BOOL, TAG_F64, TAG_I64,
+    TAG_STR, TAG_U64, decode_field, write_field_into,
 };
 use crate::spooky_value::SpookyValue;
 
@@ -98,33 +98,31 @@ impl SpookyRecordMut {
         };
 
         let field_count = map.len();
-        let mut entries: Vec<(u64, Vec<u8>, u8)> = Vec::with_capacity(field_count);
-        for (key, value) in map.iter() {
-            let hash = xxh64(key.as_bytes(), 0);
-            let (bytes, tag) = serialize_field(value)?;
-            entries.push((hash, bytes, tag));
-        }
-        entries.sort_unstable_by_key(|(hash, _, _)| *hash);
-
         let index_size = field_count * INDEX_ENTRY_SIZE;
         let data_start = HEADER_SIZE + index_size;
-        let total_data: usize = entries.iter().map(|(_, b, _)| b.len()).sum();
-        let total_size = data_start + total_data;
 
-        let mut buf = vec![0u8; total_size];
+        // Sort references by hash — no data copying yet
+        let mut entries: Vec<(&SpookyValue, u64)> = Vec::with_capacity(field_count);
+        for (key, value) in map.iter() {
+            entries.push((value, xxh64(key.as_bytes(), 0)));
+        }
+        entries.sort_unstable_by_key(|(_, hash)| *hash);
+
+        // Single buffer, write data directly
+        let mut buf = Vec::with_capacity(data_start + field_count * 16);
+        buf.resize(data_start, 0);
         buf[0..4].copy_from_slice(&(field_count as u32).to_le_bytes());
 
-        let mut data_offset = data_start;
-        for (i, (hash, data, tag)) in entries.iter().enumerate() {
+        for (i, (value, hash)) in entries.iter().enumerate() {
+            let data_offset = buf.len();
+            let tag = write_field_into(&mut buf, value)?;
+            let data_length = buf.len() - data_offset;
+
             let idx = HEADER_SIZE + i * INDEX_ENTRY_SIZE;
             buf[idx..idx + 8].copy_from_slice(&hash.to_le_bytes());
             buf[idx + 8..idx + 12].copy_from_slice(&(data_offset as u32).to_le_bytes());
-            buf[idx + 12..idx + 16].copy_from_slice(&(data.len() as u32).to_le_bytes());
-            buf[idx + 16] = *tag;
-            if !data.is_empty() {
-                buf[data_offset..data_offset + data.len()].copy_from_slice(data);
-            }
-            data_offset += data.len();
+            buf[idx + 12..idx + 16].copy_from_slice(&(data_length as u32).to_le_bytes());
+            buf[idx + 16] = tag;
         }
 
         Ok(SpookyRecordMut {
@@ -412,7 +410,8 @@ impl SpookyRecordMut {
     /// - Different size → splice + offset fixup (~200-500ns)
     pub fn set_field(&mut self, name: &str, value: &SpookyValue) -> Result<(), RecordError> {
         let (pos, meta) = self.find_field(name)?;
-        let (new_bytes, new_tag) = serialize_field(value)?;
+        let mut new_bytes = Vec::new();
+        let new_tag = write_field_into(&mut new_bytes, value)?;
 
         if new_bytes.len() == meta.data_length {
             // Fast path: same size
@@ -457,7 +456,8 @@ impl SpookyRecordMut {
             return Err(RecordError::FieldExists);
         }
 
-        let (new_bytes, new_tag) = serialize_field(value)?;
+        let mut new_bytes = Vec::new();
+        let new_tag = write_field_into(&mut new_bytes, value)?;
         let insert_pos = self.find_insert_pos(hash);
         let old_n = self.field_count as usize;
         let new_n = old_n + 1;
@@ -759,7 +759,7 @@ impl SpookyRecordMut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spooky_record::{TAG_NULL, SpookyRecord};
+    use crate::spooky_record::{SpookyRecord, TAG_NULL};
     use crate::spooky_value::FastMap;
     use smol_str::SmolStr;
 
@@ -947,7 +947,8 @@ mod tests {
         let mut rec = make_record_mut();
         // Add a field that forces buffer growth/move
         let long_str = "x".repeat(100);
-        rec.add_field("description", &SpookyValue::from(long_str.as_str())).unwrap();
+        rec.add_field("description", &SpookyValue::from(long_str.as_str()))
+            .unwrap();
 
         assert_eq!(rec.get_str("description"), Some(long_str.as_str()));
         // Verify old fields still work
