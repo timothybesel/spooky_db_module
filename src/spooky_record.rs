@@ -87,8 +87,7 @@ pub fn serialize_field(value: &SpookyValue) -> Result<(Vec<u8>, u8), RecordError
         },
         SpookyValue::Str(s) => (s.as_bytes().to_vec(), TAG_STR),
         SpookyValue::Array(_) | SpookyValue::Object(_) => {
-            let mut buf = Vec::new();
-            ciborium::into_writer(value, &mut buf)
+            let buf = cbor4ii::serde::to_vec(Vec::new(), value)
                 .map_err(|e| RecordError::CborError(e.to_string()))?;
             (buf, TAG_NESTED_CBOR)
         }
@@ -384,7 +383,7 @@ pub fn decode_field(field: FieldRef) -> Option<SpookyValue> {
         }
         TAG_STR => SpookyValue::Str(SmolStr::from(std::str::from_utf8(field.data).ok()?)),
         TAG_NESTED_CBOR => {
-            let cbor_val: ciborium::Value = ciborium::from_reader(field.data).ok()?;
+            let cbor_val: cbor4ii::core::Value = cbor4ii::serde::from_slice(field.data).ok()?;
             SpookyValue::from(cbor_val)
         }
         _ => return None,
