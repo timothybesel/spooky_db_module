@@ -1,5 +1,7 @@
 # 🎃 SpookyDB Module
 
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/timothybesel/spooky_db_module?utm_source=badge)
+
 A high-performance, zero-copy binary record format for Rust. SpookyDB serializes structured data into a compact hybrid format with **O(log n) field lookups** and **nanosecond-level mutation** — no parsing required until you access a field.
 
 ## Architecture
