@@ -298,6 +298,116 @@ fn bench_field_migration(c: &mut Criterion) {
     group.finish();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Group 5: FieldSlot — cached O(1) access vs by-name O(log n)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn bench_fieldslot(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fieldslot");
+
+    let binary = make_binary();
+    let mut rec = SpookyRecordMut::from_vec(binary.clone()).unwrap();
+
+    // Resolve slots up-front
+    let age_slot = rec.resolve("age").unwrap();
+    let name_slot = rec.resolve("name").unwrap();
+    let active_slot = rec.resolve("active").unwrap();
+    let score_slot = rec.resolve("score").unwrap();
+
+    // ── Reads ──
+
+    group.bench_function("get_i64 (by name)", |b| {
+        b.iter(|| rec.get_i64(black_box("age")))
+    });
+
+    group.bench_function("get_i64_at (slot)", |b| {
+        b.iter(|| rec.get_i64_at(black_box(&age_slot)))
+    });
+
+    group.bench_function("get_str (by name)", |b| {
+        b.iter(|| rec.get_str(black_box("name")))
+    });
+
+    group.bench_function("get_str_at (slot)", |b| {
+        b.iter(|| rec.get_str_at(black_box(&name_slot)))
+    });
+
+    group.bench_function("get_bool (by name)", |b| {
+        b.iter(|| rec.get_bool(black_box("active")))
+    });
+
+    group.bench_function("get_bool_at (slot)", |b| {
+        b.iter(|| rec.get_bool_at(black_box(&active_slot)))
+    });
+
+    group.bench_function("get_f64 (by name)", |b| {
+        b.iter(|| rec.get_f64(black_box("score")))
+    });
+
+    group.bench_function("get_f64_at (slot)", |b| {
+        b.iter(|| rec.get_f64_at(black_box(&score_slot)))
+    });
+
+    // ── Writes ──
+
+    group.bench_function("set_i64 (by name)", |b| {
+        b.iter(|| rec.set_i64(black_box("age"), black_box(42)).unwrap())
+    });
+
+    group.bench_function("set_i64_at (slot)", |b| {
+        b.iter(|| rec.set_i64_at(black_box(&age_slot), black_box(42)).unwrap())
+    });
+
+    group.bench_function("set_str_exact (by name)", |b| {
+        b.iter(|| rec.set_str_exact(black_box("name"), black_box("Bobby")).unwrap())
+    });
+
+    group.bench_function("set_str_at (slot, same len)", |b| {
+        b.iter(|| rec.set_str_at(black_box(&name_slot), black_box("Bobby")).unwrap())
+    });
+
+    group.finish();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Group 6: Buffer Reuse — serialize_into vs serialize
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn bench_buffer_reuse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("buffer_reuse");
+
+    let value = make_spooky_value();
+
+    // ── SpookyRecord::serialize vs serialize_into ──
+
+    group.bench_function("serialize (fresh alloc)", |b| {
+        b.iter(|| SpookyRecord::serialize(black_box(&value)).unwrap())
+    });
+
+    group.bench_function("serialize_into (reuse)", |b| {
+        let mut buf = Vec::new();
+        b.iter(|| SpookyRecord::serialize_into(black_box(&value), &mut buf).unwrap())
+    });
+
+    // ── SpookyRecordMut::from_spooky_value vs from_spooky_value_into ──
+
+    group.bench_function("from_spooky_value (fresh alloc)", |b| {
+        b.iter(|| SpookyRecordMut::from_spooky_value(black_box(&value)).unwrap())
+    });
+
+    group.bench_function("from_spooky_value_into (reuse)", |b| {
+        b.iter_batched(
+            || SpookyRecordMut::from_spooky_value(&value).unwrap().into_bytes(),
+            |buf| {
+                SpookyRecordMut::from_spooky_value_into(black_box(&value), buf).unwrap()
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    group.finish();
+}
+
 // ─── Criterion Main ─────────────────────────────────────────────────────────
 
 criterion_group!(
@@ -306,5 +416,7 @@ criterion_group!(
     bench_reading_values,
     bench_set_values,
     bench_field_migration,
+    bench_fieldslot,
+    bench_buffer_reuse,
 );
 criterion_main!(benches);

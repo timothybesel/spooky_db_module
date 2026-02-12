@@ -186,6 +186,62 @@ impl<'a> SpookyRecord<'a> {
         Ok(buf)
     }
 
+    /// Serialize a SpookyValue::Object into a reusable buffer.
+    ///
+    /// Identical to `serialize`, but reuses the caller's Vec to eliminate
+    /// allocations when serializing many records in sequence (sync ingestion,
+    /// snapshot rebuild). The buffer is cleared but retains its capacity.
+    ///
+    /// **IMPORTANT**: The index is sorted by name_hash.
+    pub fn serialize_into(data: &SpookyValue, buf: &mut Vec<u8>) -> Result<(), RecordError> {
+        let map = match data {
+            SpookyValue::Object(map) => map,
+            _ => {
+                return Err(RecordError::TypeMismatch {
+                    expected: TAG_NESTED_CBOR,
+                    actual: TAG_NULL,
+                });
+            }
+        };
+
+        let field_count = map.len();
+        let index_size = field_count * INDEX_ENTRY_SIZE;
+        let data_start = HEADER_SIZE + index_size;
+
+        // Collect hashes, sort by hash
+        let mut entries: Vec<(&smol_str::SmolStr, &SpookyValue, u64)> =
+            Vec::with_capacity(field_count);
+
+        for (key, value) in map.iter() {
+            let hash = xxh64(key.as_bytes(), 0);
+            entries.push((key, value, hash));
+        }
+        entries.sort_unstable_by_key(|(_, _, hash)| *hash);
+
+        // Reuse buffer — clears but retains capacity
+        buf.clear();
+        buf.reserve(data_start + field_count * 16);
+        buf.resize(data_start, 0);
+
+        // Write header
+        buf[0..4].copy_from_slice(&(field_count as u32).to_le_bytes());
+
+        // Write field data directly into buf, record index entries
+        for (i, (_, value, hash)) in entries.iter().enumerate() {
+            let data_offset = buf.len();
+            let tag = write_field_into(buf, value)?;
+            let data_length = buf.len() - data_offset;
+
+            let idx = HEADER_SIZE + i * INDEX_ENTRY_SIZE;
+            buf[idx..idx + 8].copy_from_slice(&hash.to_le_bytes());
+            buf[idx + 8..idx + 12].copy_from_slice(&(data_offset as u32).to_le_bytes());
+            buf[idx + 12..idx + 16].copy_from_slice(&(data_length as u32).to_le_bytes());
+            buf[idx + 16] = tag;
+        }
+
+        Ok(())
+    }
+
     /// Wrap a byte slice as a SpookyRecord. No copies, no parsing.
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, RecordError> {
         if bytes.len() < HEADER_SIZE {

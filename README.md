@@ -2,7 +2,7 @@
 
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/timothybesel/spooky_db_module?utm_source=badge)
 
-A high-performance, zero-copy binary record format for Rust. SpookyDB serializes structured data into a compact hybrid format with **O(log n) field lookups** and **nanosecond-level mutation** — no parsing required until you access a field.
+A high-performance, zero-copy binary record format for Rust. SpookyDB serializes structured data into a compact hybrid format with **O(log n) field lookups**, **O(1) cached access via FieldSlots**, and **nanosecond-level mutation** — no parsing required until you access a field.
 
 ## Architecture
 
@@ -71,11 +71,55 @@ rec.add_field("new", &SpookyValue::from(true)).unwrap();// ~191 ns
 rec.remove_field("old").unwrap();                       // ~146 ns
 ```
 
+### FieldSlot Cached Access (O(1))
+
+For hot paths where the same fields are read/written repeatedly (e.g. DBSP change detection), resolve a field once and access it via cached `FieldSlot` — **up to 14× faster** than by-name lookups:
+
+```rust
+// Resolve once — O(log n) binary search
+let age_slot = rec.resolve("age").unwrap();
+let name_slot = rec.resolve("name").unwrap();
+
+// Read via slot — O(1), no hashing, no search (~1 ns)
+let age = rec.get_i64_at(&age_slot);       // Some(29)
+let name = rec.get_str_at(&name_slot);     // Some("Bobby")
+
+// Write via slot — O(1), in-place (~0.6 ns)
+rec.set_i64_at(&age_slot, 30).unwrap();
+
+// Slots auto-invalidate on layout changes (debug assertion)
+rec.add_field("x", &SpookyValue::from(1i64)).unwrap();  // bumps generation
+// age_slot is now stale — re-resolve needed
+let age_slot = rec.resolve("age").unwrap();
+```
+
+### Buffer Reuse for Bulk Serialization
+
+Eliminate per-record heap allocations when serializing many records (**~17% faster**):
+
+```rust
+// Serialize thousands of records with one allocation
+let mut buf = Vec::new();
+for record in incoming_stream {
+    SpookyRecord::serialize_into(&record, &mut buf)?;
+    store.put(key, &buf);  // buf reused on next iteration
+}
+
+// Build many mutable records from reused buffer
+let mut buf = Vec::with_capacity(1024);
+for data in batch {
+    let rec = SpookyRecordMut::from_spooky_value_into(&data, buf)?;
+    process(&rec);
+    buf = rec.into_bytes();  // reclaim buffer
+}
+```
+
 ### SpookyRecord (Immutable)
 
 | Method | Returns | Description |
 |---|---|---|
 | `serialize(&SpookyValue)` | `Result<Vec<u8>>` | Serialize object to binary |
+| `serialize_into(&SpookyValue, &mut Vec)` | `Result<()>` | Serialize into reusable buffer |
 | `from_bytes(&[u8])` | `Result<Self>` | Zero-copy wrap byte slice |
 | `get_str(name)` | `Option<&str>` | Zero-copy string access |
 | `get_i64(name)` | `Option<i64>` | Read i64 field |
@@ -95,8 +139,10 @@ rec.remove_field("old").unwrap();                       // ~146 ns
 | Method | Description |
 |---|---|
 | `from_spooky_value(&SpookyValue)` | Create from value |
+| `from_spooky_value_into(&SpookyValue, Vec)` | Create from value, reuse buffer |
 | `from_vec(Vec<u8>)` | Take ownership of buffer |
 | `new_empty()` | Empty record |
+| **By-name access** | |
 | `set_i64(name, val)` | In-place i64 overwrite |
 | `set_u64(name, val)` | In-place u64 overwrite |
 | `set_f64(name, val)` | In-place f64 overwrite |
@@ -107,6 +153,19 @@ rec.remove_field("old").unwrap();                       // ~146 ns
 | `set_null(name)` | Set field to null |
 | `add_field(name, &SpookyValue)` | Add new field |
 | `remove_field(name)` | Remove field |
+| **FieldSlot cached access** | |
+| `resolve(name)` | Resolve field → `FieldSlot` (one-time O(log n)) |
+| `get_i64_at(&slot)` | O(1) cached i64 read |
+| `get_u64_at(&slot)` | O(1) cached u64 read |
+| `get_f64_at(&slot)` | O(1) cached f64 read |
+| `get_bool_at(&slot)` | O(1) cached bool read |
+| `get_str_at(&slot)` | O(1) cached string read |
+| `set_i64_at(&slot, val)` | O(1) cached i64 write |
+| `set_u64_at(&slot, val)` | O(1) cached u64 write |
+| `set_f64_at(&slot, val)` | O(1) cached f64 write |
+| `set_bool_at(&slot, val)` | O(1) cached bool write |
+| `set_str_at(&slot, val)` | O(1) same-length string write |
+| **Other** | |
 | `as_record()` | Borrow as `SpookyRecord` |
 
 ### SpookyValue
@@ -203,6 +262,30 @@ The benchmark uses a **341-byte CBOR payload** with 12 top-level fields covering
 | `set_field` | **26.26 ns** | ~38.1M writes/sec | Generic path |
 | `set_null` | **10.07 ns** | ~99.3M writes/sec | In-place overwrite |
 
+### FieldSlot: Cached Access vs By-Name
+
+FieldSlots eliminate the O(log n) binary search by caching the resolved field position. The slot stores the data offset, length, and type tag from the initial `resolve()` call. Subsequent `_at` accessors skip hashing and searching entirely — they index directly into the buffer.
+
+A `generation` counter on `SpookyRecordMut` tracks layout changes. Fixed-width writes (`set_i64`, `set_bool`, same-length `set_str`) don't change layout, so slots remain valid. Structural mutations (`add_field`, `remove_field`, variable-length splice) bump the generation, invalidating all outstanding slots. Staleness is caught by `debug_assert` in `_at` methods — zero overhead in release builds.
+
+| Operation | By Name | FieldSlot | Speedup |
+|---|---|---|---|
+| `get_i64` | **9.13 ns** | **1.48 ns** | 6.2× |
+| `get_str` | **9.55 ns** | **3.87 ns** | 2.5× |
+| `get_bool` | **9.10 ns** | **0.94 ns** | 9.7× |
+| `get_f64` | **11.65 ns** | **1.00 ns** | 11.6× |
+| `set_i64` | **8.84 ns** | **0.64 ns** | 13.8× |
+| `set_str` (same len) | **9.74 ns** | **4.37 ns** | 2.2× |
+
+### Buffer Reuse: Bulk Serialization
+
+`serialize_into` and `from_spooky_value_into` reuse a caller-provided `Vec<u8>`, clearing it but retaining its heap allocation. This eliminates the per-record `Vec::new()` + allocation cost that dominates when serializing many records in sequence (sync ingestion, snapshot rebuild). The buffer naturally grows to the high-water mark and stays there.
+
+| Operation | Fresh Alloc | Reused Buffer | Improvement |
+|---|---|---|---|
+| `serialize` | **528.30 ns** | **440.29 ns** | 17% faster |
+| `from_spooky_value` | **519.85 ns** | **429.34 ns** | 17% faster |
+
 ### Field Migration
 
 | Operation | Median | Throughput | Description |
@@ -213,15 +296,18 @@ The benchmark uses a **341-byte CBOR payload** with 12 top-level fields covering
 ### Throughput Summary
 
 ```
-  ┌─────────────────────────────────────────────────────────────┐
-  │ Operation          │ Speed           │ Category             │
-  ├────────────────────┼─────────────────┼──────────────────────┤
-  │ Typed reads        │ ~94-111M ops/s  │ Zero-copy, 0 allocs  │
-  │ In-place sets      │ ~118-155M ops/s │ Zero-alloc overwrites│
-  │ String splice      │ ~36-85M ops/s   │ Buffer resize        │
-  │ Add/Remove field   │ ~5-7M ops/s     │ Full rebuild         │
-  │ Full serialize     │ ~250-260K recs/s│ CBOR parse + layout  │
-  └─────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ Operation              │ Speed              │ Category              │
+  ├────────────────────────┼────────────────────┼───────────────────────┤
+  │ FieldSlot reads        │ ~670M-1.06B ops/s  │ O(1) cached, 0 allocs │
+  │ FieldSlot writes       │ ~228M-1.56B ops/s  │ O(1) cached, 0 allocs │
+  │ Typed reads (by name)  │ ~86-111M ops/s     │ O(log n), 0 allocs    │
+  │ In-place sets          │ ~118-155M ops/s    │ Zero-alloc overwrites │
+  │ String splice          │ ~36-85M ops/s      │ Buffer resize         │
+  │ Add/Remove field       │ ~5-7M ops/s        │ Full rebuild          │
+  │ Serialize (reuse buf)  │ ~2.3M recs/s       │ Buffer reuse          │
+  │ Serialize (fresh)      │ ~1.9M recs/s       │ Allocates per record  │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Run Benchmarks
@@ -232,6 +318,8 @@ cargo bench
 
 # Specific group
 cargo bench --bench spooky_bench -- reading_values
+cargo bench --bench spooky_bench -- fieldslot
+cargo bench --bench spooky_bench -- buffer_reuse
 
 # Quick smoke test
 cargo bench --bench spooky_bench -- --test

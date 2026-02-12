@@ -28,6 +28,22 @@ struct IndexMeta {
     type_tag: u8,
 }
 
+// ─── FieldSlot (Cached Field Position) ─────────────────────────────────────
+
+/// Cached field position for O(1) access.
+///
+/// Holds everything needed to read/write a field directly without hashing
+/// or searching. Valid only while `generation` matches the record's generation.
+/// Staleness is checked via debug assertions.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldSlot {
+    pub(crate) index_pos: usize,
+    pub(crate) data_offset: usize,
+    pub(crate) data_length: usize,
+    pub(crate) type_tag: u8,
+    pub(crate) generation: u32,
+}
+
 // ─── SpookyRecordMut ────────────────────────────────────────────────────────
 
 /// Mutable record that owns its buffer and supports efficient in-place updates.
@@ -51,6 +67,9 @@ struct IndexMeta {
 pub struct SpookyRecordMut {
     buf: Vec<u8>,
     field_count: u32,
+    /// Generation counter, bumped on every layout-changing mutation.
+    /// Used to detect stale FieldSlots.
+    generation: u32,
 }
 
 #[allow(dead_code)]
@@ -76,7 +95,11 @@ impl SpookyRecordMut {
         if buf.len() < min_size {
             return Err(RecordError::InvalidBuffer);
         }
-        Ok(SpookyRecordMut { buf, field_count })
+        Ok(SpookyRecordMut {
+            buf,
+            field_count,
+            generation: 0,
+        })
     }
 
     /// Create a new empty mutable record.
@@ -86,6 +109,7 @@ impl SpookyRecordMut {
         SpookyRecordMut {
             buf,
             field_count: 0,
+            generation: 0,
         }
     }
 
@@ -128,6 +152,59 @@ impl SpookyRecordMut {
         Ok(SpookyRecordMut {
             buf,
             field_count: field_count as u32,
+            generation: 0,
+        })
+    }
+
+    /// Create a mutable record from a SpookyValue::Object, reusing a buffer.
+    ///
+    /// Identical to `from_spooky_value`, but reuses the caller's Vec to eliminate
+    /// allocations when building many records in sequence. The buffer is cleared
+   /// but retains its capacity.
+    ///
+    /// Produces a sorted index.
+    pub fn from_spooky_value_into(
+        data: &SpookyValue,
+        mut buf: Vec<u8>,
+    ) -> Result<Self, RecordError> {
+        let map = match data {
+            SpookyValue::Object(map) => map,
+            _ => return Err(RecordError::InvalidBuffer),
+        };
+
+        let field_count = map.len();
+        let index_size = field_count * INDEX_ENTRY_SIZE;
+        let data_start = HEADER_SIZE + index_size;
+
+        // Sort references by hash
+        let mut entries: Vec<(&SpookyValue, u64)> = Vec::with_capacity(field_count);
+        for (key, value) in map.iter() {
+            entries.push((value, xxh64(key.as_bytes(), 0)));
+        }
+        entries.sort_unstable_by_key(|(_, hash)| *hash);
+
+        // Reuse buffer — clears but retains capacity
+        buf.clear();
+        buf.reserve(data_start + field_count * 16);
+        buf.resize(data_start, 0);
+        buf[0..4].copy_from_slice(&(field_count as u32).to_le_bytes());
+
+        for (i, (value, hash)) in entries.iter().enumerate() {
+            let data_offset = buf.len();
+            let tag = write_field_into(&mut buf, value)?;
+            let data_length = buf.len() - data_offset;
+
+            let idx = HEADER_SIZE + i * INDEX_ENTRY_SIZE;
+            buf[idx..idx + 8].copy_from_slice(&hash.to_le_bytes());
+            buf[idx + 8..idx + 12].copy_from_slice(&(data_offset as u32).to_le_bytes());
+            buf[idx + 12..idx + 16].copy_from_slice(&(data_length as u32).to_le_bytes());
+            buf[idx + 16] = tag;
+        }
+
+        Ok(SpookyRecordMut {
+            buf,
+            field_count: field_count as u32,
+            generation: 0,
         })
     }
 
@@ -375,6 +452,7 @@ impl SpookyRecordMut {
             self.splice_data(meta.data_offset, meta.data_length, new_bytes);
             self.write_index_length(pos, new_bytes.len());
             self.fixup_offsets_after_splice(pos, meta.data_offset, delta);
+            self.generation += 1; // Layout changed
         }
         Ok(())
     }
@@ -429,6 +507,7 @@ impl SpookyRecordMut {
             self.write_index_length(pos, new_bytes.len());
             self.write_index_tag(pos, new_tag);
             self.fixup_offsets_after_splice(pos, meta.data_offset, delta);
+            self.generation += 1; // Layout changed
         }
         Ok(())
     }
@@ -524,6 +603,7 @@ impl SpookyRecordMut {
 
         self.buf = new_buf;
         self.field_count = new_n as u32;
+        self.generation += 1; // Added field, layout changed
         Ok(())
     }
 
@@ -584,6 +664,7 @@ impl SpookyRecordMut {
 
         self.buf = new_buf;
         self.field_count = new_n as u32;
+        self.generation += 1; // Removed field, layout changed
         Ok(())
     }
 
@@ -729,6 +810,175 @@ impl SpookyRecordMut {
     #[inline]
     pub fn field_count(&self) -> u32 {
         self.field_count
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // FieldSlot — O(1) cached access
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Resolve a field by name into a cached FieldSlot.
+    ///
+    /// This performs one O(log n) lookup and caches all metadata needed for
+    /// future O(1) access via `get_*_at` and `set_*_at` methods.
+    ///
+    /// The returned slot is valid until a layout-changing operation
+    /// (add_field, remove_field, or variable-length splice). Staleness
+    /// is checked via debug assertions in all `_at` methods.
+    pub fn resolve(&self, name: &str) -> Option<FieldSlot> {
+        let (index_pos, meta) = self.find_field(name).ok()?;
+        Some(FieldSlot {
+            index_pos,
+            data_offset: meta.data_offset,
+            data_length: meta.data_length,
+            type_tag: meta.type_tag,
+            generation: self.generation,
+        })
+    }
+
+    /// Get an i64 field using a cached FieldSlot. ~2-3ns vs ~10ns for by-name.
+    #[inline]
+    pub fn get_i64_at(&self, slot: &FieldSlot) -> Option<i64> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_I64 || slot.data_length != 8 {
+            return None;
+        }
+        Some(i64::from_le_bytes(
+            self.buf[slot.data_offset..slot.data_offset + 8]
+                .try_into()
+                .ok()?,
+        ))
+    }
+
+    /// Get a u64 field using a cached FieldSlot.
+    #[inline]
+    pub fn get_u64_at(&self, slot: &FieldSlot) -> Option<u64> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_U64 || slot.data_length != 8 {
+            return None;
+        }
+        Some(u64::from_le_bytes(
+            self.buf[slot.data_offset..slot.data_offset + 8]
+                .try_into()
+                .ok()?,
+        ))
+    }
+
+    /// Get an f64 field using a cached FieldSlot.
+    #[inline]
+    pub fn get_f64_at(&self, slot: &FieldSlot) -> Option<f64> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_F64 || slot.data_length != 8 {
+            return None;
+        }
+        Some(f64::from_le_bytes(
+            self.buf[slot.data_offset..slot.data_offset + 8]
+                .try_into()
+                .ok()?,
+        ))
+    }
+
+    /// Get a bool field using a cached FieldSlot.
+    #[inline]
+    pub fn get_bool_at(&self, slot: &FieldSlot) -> Option<bool> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_BOOL || slot.data_length != 1 {
+            return None;
+        }
+        Some(self.buf[slot.data_offset] != 0)
+    }
+
+    /// Get a string field using a cached FieldSlot (zero-copy).
+    #[inline]
+    pub fn get_str_at(&self, slot: &FieldSlot) -> Option<&str> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_STR {
+            return None;
+        }
+        std::str::from_utf8(&self.buf[slot.data_offset..slot.data_offset + slot.data_length]).ok()
+    }
+
+    /// Set an i64 field using a cached FieldSlot. In-place, ~20ns.
+    #[inline]
+    pub fn set_i64_at(&mut self, slot: &FieldSlot, value: i64) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_I64 {
+            return Err(RecordError::TypeMismatch {
+                expected: TAG_I64,
+                actual: slot.type_tag,
+            });
+        }
+        self.buf[slot.data_offset..slot.data_offset + 8].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    /// Set a u64 field using a cached FieldSlot. In-place, ~20ns.
+    #[inline]
+    pub fn set_u64_at(&mut self, slot: &FieldSlot, value: u64) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_U64 {
+            return Err(RecordError::TypeMismatch {
+                expected: TAG_U64,
+                actual: slot.type_tag,
+            });
+        }
+        self.buf[slot.data_offset..slot.data_offset + 8].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    /// Set an f64 field using a cached FieldSlot. In-place, ~20ns.
+    #[inline]
+    pub fn set_f64_at(&mut self, slot: &FieldSlot, value: f64) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_F64 {
+            return Err(RecordError::TypeMismatch {
+                expected: TAG_F64,
+                actual: slot.type_tag,
+            });
+        }
+        self.buf[slot.data_offset..slot.data_offset + 8].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    /// Set a bool field using a cached FieldSlot. In-place, ~18ns.
+    #[inline]
+    pub fn set_bool_at(&mut self, slot: &FieldSlot, value: bool) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_BOOL {
+            return Err(RecordError::TypeMismatch {
+                expected: TAG_BOOL,
+                actual: slot.type_tag,
+            });
+        }
+        self.buf[slot.data_offset] = value as u8;
+        Ok(())
+    }
+
+    /// Set a string field using a cached FieldSlot.
+    ///
+    /// **Conservative strategy**: Only accepts same-byte-length writes.
+    /// Returns `LengthMismatch` if the new value has a different byte length.
+    /// Caller should fall back to `set_str` + re-resolve on mismatch.
+    ///
+    /// Same-length writes are in-place (~22ns) and don't invalidate the slot.
+    #[inline]
+    pub fn set_str_at(&mut self, slot: &FieldSlot, value: &str) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_STR {
+            return Err(RecordError::TypeMismatch {
+                expected: TAG_STR,
+                actual: slot.type_tag,
+            });
+        }
+        let new_bytes = value.as_bytes();
+        if new_bytes.len() != slot.data_length {
+            return Err(RecordError::LengthMismatch {
+                expected: slot.data_length,
+                actual: new_bytes.len(),
+            });
+        }
+        self.buf[slot.data_offset..slot.data_offset + slot.data_length]
+            .copy_from_slice(new_bytes);
+        Ok(())
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1240,5 +1490,218 @@ mod tests {
         rec.add_field("nothing", &SpookyValue::Null).unwrap();
         assert_eq!(rec.field_type("nothing"), Some(TAG_NULL));
         assert_eq!(rec.get_field("nothing"), Some(SpookyValue::Null));
+    }
+
+    // ── Phase 1: FieldSlot Tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_and_get_at() {
+        let rec = make_record_mut();
+        
+        // Resolve all fields
+        let id_slot = rec.resolve("id").expect("id exists");
+        let age_slot = rec.resolve("age").expect("age exists");
+        let score_slot = rec.resolve("score").expect("score exists");
+        let active_slot = rec.resolve("active").expect("active exists");
+        let level_slot = rec.resolve("level").expect("level exists");
+        
+        // Read via slots - should match by-name accessors
+        assert_eq!(rec.get_str_at(&id_slot), Some("user:123"));
+        assert_eq!(rec.get_i64_at(&age_slot), Some(30));
+        assert_eq!(rec.get_f64_at(&score_slot), Some(99.5));
+        assert_eq!(rec.get_bool_at(&active_slot), Some(true));
+        assert_eq!(rec.get_u64_at(&level_slot), Some(42));
+    }
+
+    #[test]
+    fn test_set_at_fixed_width() {
+        let mut rec = make_record_mut();
+        
+        let age_slot = rec.resolve("age").unwrap();
+        let score_slot = rec.resolve("score").unwrap();
+        let active_slot = rec.resolve("active").unwrap();
+        let level_slot = rec.resolve("level").unwrap();
+        
+        // Mutate via slots
+        rec.set_i64_at(&age_slot, 31).unwrap();
+        rec.set_f64_at(&score_slot, 100.0).unwrap();
+        rec.set_bool_at(&active_slot, false).unwrap();
+        rec.set_u64_at(&level_slot, 43).unwrap();
+        
+        // Read back
+        assert_eq!(rec.get_i64_at(&age_slot), Some(31));
+        assert_eq!(rec.get_f64_at(&score_slot), Some(100.0));
+        assert_eq!(rec.get_bool_at(&active_slot), Some(false));
+        assert_eq!(rec.get_u64_at(&level_slot), Some(43));
+        
+        // Slots should still be valid (generation didn't change)
+        assert_eq!(rec.get_i64("age"), Some(31));
+    }
+
+    #[test]
+    fn test_set_str_at_same_length() {
+        let mut rec = make_record_mut();
+        let name_slot = rec.resolve("name").unwrap();
+        
+        // "Alice" is 5 bytes, "Carol" is also 5 bytes
+        rec.set_str_at(&name_slot, "Carol").unwrap();
+        assert_eq!(rec.get_str_at(&name_slot), Some("Carol"));
+        
+        // Slot still valid
+        assert_eq!(rec.get_str("name"), Some("Carol"));
+    }
+
+    #[test]
+    fn test_set_str_at_length_mismatch() {
+        let mut rec = make_record_mut();
+        let name_slot = rec.resolve("name").unwrap();
+        
+        // "Alice" is 5 bytes, "Bob" is 3 bytes
+        let result = rec.set_str_at(&name_slot, "Bob");
+        assert!(matches!(result, Err(RecordError::LengthMismatch { .. })));
+    }
+
+    #[test]
+    fn test_generation_bump_on_splice() {
+        let mut rec = make_record_mut();
+        let old_gen = rec.generation;
+        
+        // Resolve slot
+        let name_slot = rec.resolve("name").unwrap();
+        assert_eq!(name_slot.generation, old_gen);
+        
+        // Splice triggers generation bump (different length)
+        rec.set_str("name", "Alexander").unwrap();
+        assert_eq!(rec.generation, old_gen + 1);
+        
+        // Re-resolve to get fresh slot
+        let new_slot = rec.resolve("name").unwrap();
+        assert_eq!(new_slot.generation, old_gen + 1);
+        assert_eq!(rec.get_str_at(&new_slot), Some("Alexander"));
+    }
+
+    #[test]
+    fn test_generation_bump_on_add_remove() {
+        let mut rec = make_record_mut();
+        let old_gen = rec.generation;
+        
+        let age_slot = rec.resolve("age").unwrap();
+        assert_eq!(age_slot.generation, old_gen);
+        
+        // add_field bumps generation
+        rec.add_field("email", &SpookyValue::from("test@example.com"))
+            .unwrap();
+        assert_eq!(rec.generation, old_gen + 1);
+        
+        // remove_field bumps again
+        rec.remove_field("email").unwrap();
+        assert_eq!(rec.generation, old_gen + 2);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "stale FieldSlot")]
+    fn test_stale_slot_debug_panic() {
+        let mut rec = make_record_mut();
+        let age_slot = rec.resolve("age").unwrap();
+        
+        // Invalidate the slot by adding a field
+        rec.add_field("email", &SpookyValue::from("test@test.com"))
+            .unwrap();
+        
+        // This should panic in debug mode
+        let _ = rec.get_i64_at(&age_slot);
+    }
+
+    #[test]
+    fn test_resolve_missing_field() {
+        let rec = make_record_mut();
+        assert!(rec.resolve("nonexistent").is_none());
+    }
+
+    // ── Phase 2: Buffer Reuse Tests ────────────────────────────────────────
+
+    #[test]
+    fn test_serialize_into_roundtrip() {
+        let value = make_test_value();
+        let mut buf = Vec::new();
+        
+        SpookyRecord::serialize_into(&value, &mut buf).unwrap();
+        
+        let rec = SpookyRecord::from_bytes(&buf).unwrap();
+        assert_eq!(rec.field_count(), 6);
+        assert_eq!(rec.get_str("id"), Some("user:123"));
+        assert_eq!(rec.get_str("name"), Some("Alice"));
+        assert_eq!(rec.get_i64("age"), Some(30));
+    }
+
+    #[test]
+    fn test_serialize_into_reuse() {
+        let value_a = make_test_value();
+        let mut map_b = FastMap::new();
+        map_b.insert(SmolStr::from("x"), SpookyValue::from(100i64));
+        map_b.insert(SmolStr::from("y"), SpookyValue::from(200i64));
+        let value_b = SpookyValue::Object(map_b);
+        
+        let mut buf = Vec::new();
+        
+        // Serialize record A
+        SpookyRecord::serialize_into(&value_a, &mut buf).unwrap();
+        let cap_after_a = buf.capacity();
+        
+        // Serialize record B into same buffer
+        SpookyRecord::serialize_into(&value_b, &mut buf).unwrap();
+        
+        // Buffer should be reused (capacity shouldn't decrease)
+        assert!(buf.capacity() >= cap_after_a);
+        
+        // Verify B's data is correct
+        let rec_b = SpookyRecord::from_bytes(&buf).unwrap();
+        assert_eq!(rec_b.field_count(), 2);
+        assert_eq!(rec_b.get_i64("x"), Some(100));
+        assert_eq!(rec_b.get_i64("y"), Some(200));
+        
+        // A's data should be gone
+        assert_eq!(rec_b.get_str("id"), None);
+    }
+
+    #[test]
+    fn test_from_spooky_value_into_roundtrip() {
+        let value = make_test_value();
+        let buf = Vec::new();
+        
+        let rec = SpookyRecordMut::from_spooky_value_into(&value, buf).unwrap();
+        
+        assert_eq!(rec.field_count(), 6);
+        assert_eq!(rec.get_str("id"), Some("user:123"));
+        assert_eq!(rec.get_i64("age"), Some(30));
+        assert_eq!(rec.get_f64("score"), Some(99.5));
+    }
+
+    #[test]
+    fn test_from_spooky_value_into_reuse() {
+        let value_a = make_test_value();
+        
+        let mut map_b = FastMap::new();
+        map_b.insert(SmolStr::from("foo"), SpookyValue::from(777i64));
+        let value_b = SpookyValue::Object(map_b);
+        
+        // Build record A
+        let rec_a = SpookyRecordMut::from_spooky_value(&value_a).unwrap();
+        let buf_a = rec_a.into_bytes();
+        let cap_after_a = buf_a.capacity();
+        
+        // Reuse that buffer for record B
+        let rec_b = SpookyRecordMut::from_spooky_value_into(&value_b, buf_a).unwrap();
+        
+        // Buffer should be reused
+        assert!(rec_b.byte_len()  <= cap_after_a);
+        
+        // Verify B is correct
+        assert_eq!(rec_b.field_count(), 1);
+        assert_eq!(rec_b.get_i64("foo"), Some(777));
+        
+        // A's data should be gone
+        assert_eq!(rec_b.get_str("id"), None);
     }
 }
