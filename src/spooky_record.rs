@@ -74,22 +74,40 @@ pub const INDEX_ENTRY_SIZE: usize = 20; // 8 + 4 + 4 + 1 + 3
 /// O(log n) binary search in both SpookyRecord and SpookyRecordMut.
 /// O(log n) binary search in both SpookyRecord and SpookyRecordMut.
 
-
 /// Serialize a single field value into (bytes, type_tag).
-pub fn serialize_field(value: &SpookyValue) -> Result<(Vec<u8>, u8), RecordError> {
+#[inline]
+pub fn write_field_into(buf: &mut Vec<u8>, value: &SpookyValue) -> Result<u8, RecordError> {
     Ok(match value {
-        SpookyValue::Null => (vec![], TAG_NULL),
-        SpookyValue::Bool(b) => (vec![*b as u8], TAG_BOOL),
+        SpookyValue::Null => TAG_NULL,
+        SpookyValue::Bool(b) => {
+            buf.push(*b as u8);
+            TAG_BOOL
+        }
         SpookyValue::Number(n) => match n {
-            SpookyNumber::I64(i) => (i.to_le_bytes().to_vec(), TAG_I64),
-            SpookyNumber::F64(f) => (f.to_le_bytes().to_vec(), TAG_F64),
-            SpookyNumber::U64(u) => (u.to_le_bytes().to_vec(), TAG_U64),
+            SpookyNumber::I64(i) => {
+                buf.extend_from_slice(&i.to_le_bytes());
+                TAG_I64
+            }
+            SpookyNumber::F64(f) => {
+                buf.extend_from_slice(&f.to_le_bytes());
+                TAG_F64
+            }
+            SpookyNumber::U64(u) => {
+                buf.extend_from_slice(&u.to_le_bytes());
+                TAG_U64
+            }
         },
-        SpookyValue::Str(s) => (s.as_bytes().to_vec(), TAG_STR),
+        SpookyValue::Str(s) => {
+            buf.extend_from_slice(s.as_bytes());
+            TAG_STR
+        }
         SpookyValue::Array(_) | SpookyValue::Object(_) => {
-            let buf = cbor4ii::serde::to_vec(Vec::new(), value)
+            // cbor4ii::serde::to_vec takes an existing Vec and appends to it
+            let len_before = buf.len();
+            *buf = cbor4ii::serde::to_vec(std::mem::take(buf), value)
                 .map_err(|e| RecordError::CborError(e.to_string()))?;
-            (buf, TAG_NESTED_CBOR)
+            let _ = buf.len() - len_before;
+            TAG_NESTED_CBOR
         }
     })
 }
@@ -135,43 +153,34 @@ impl<'a> SpookyRecord<'a> {
         let index_size = field_count * INDEX_ENTRY_SIZE;
         let data_start = HEADER_SIZE + index_size;
 
-        // Pre-serialize all field values to calculate total size
-        let mut fields: Vec<(u64, Vec<u8>, u8)> = Vec::with_capacity(field_count);
-        let mut total_data_size: usize = 0;
+        // Collect hashes + tags, sort by hash, then write data directly
+        let mut entries: Vec<(&smol_str::SmolStr, &SpookyValue, u64)> =
+            Vec::with_capacity(field_count);
 
         for (key, value) in map.iter() {
             let hash = xxh64(key.as_bytes(), 0);
-            let (bytes, tag) = serialize_field(value)?;
-            total_data_size += bytes.len();
-            fields.push((hash, bytes, tag));
+            entries.push((key, value, hash));
         }
+        entries.sort_unstable_by_key(|(_, _, hash)| *hash);
 
-        // Sort by hash for binary search at read time
-        fields.sort_unstable_by_key(|(hash, _, _)| *hash);
-
-        // Single allocation for the entire record
-        let total_size = data_start + total_data_size;
-        let mut buf = vec![0u8; total_size];
+        // Start with a reasonable estimate — avoids realloc for typical records
+        let mut buf = Vec::with_capacity(data_start + field_count * 16);
+        buf.resize(data_start, 0);
 
         // Write header
         buf[0..4].copy_from_slice(&(field_count as u32).to_le_bytes());
-        // reserved bytes [4..20] are already zero
 
-        // Write index entries + field data
-        let mut data_offset = data_start;
-        for (i, (hash, data, tag)) in fields.iter().enumerate() {
+        // Write field data directly into buf, record index entries
+        for (i, (_, value, hash)) in entries.iter().enumerate() {
+            let data_offset = buf.len();
+            let tag = write_field_into(&mut buf, value)?;
+            let data_length = buf.len() - data_offset;
+
             let idx = HEADER_SIZE + i * INDEX_ENTRY_SIZE;
-
-            // Index entry
             buf[idx..idx + 8].copy_from_slice(&hash.to_le_bytes());
             buf[idx + 8..idx + 12].copy_from_slice(&(data_offset as u32).to_le_bytes());
-            buf[idx + 12..idx + 16].copy_from_slice(&(data.len() as u32).to_le_bytes());
-            buf[idx + 16] = *tag;
-            // padding [idx+17..idx+20] already zero
-
-            // Field data
-            buf[data_offset..data_offset + data.len()].copy_from_slice(data);
-            data_offset += data.len();
+            buf[idx + 12..idx + 16].copy_from_slice(&(data_length as u32).to_le_bytes());
+            buf[idx + 16] = tag;
         }
 
         Ok(buf)

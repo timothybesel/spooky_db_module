@@ -167,8 +167,8 @@ The benchmark uses a **341-byte CBOR payload** with 12 top-level fields covering
 
 | Operation | Median | Throughput |
 |---|---|---|
-| `SpookyRecord::serialize` | **6.31 µs** | ~158K records/sec |
-| `SpookyRecordMut::from_spooky_value` | **6.24 µs** | ~160K records/sec |
+| `SpookyRecord::serialize` | **3.90 µs** | ~256K records/sec |
+| `SpookyRecordMut::from_spooky_value` | **3.84 µs** | ~260K records/sec |
 | `SpookyRecordMut::new_empty` | **17.18 ns** | ~58.2M records/sec |
 | `SpookyRecordMut::from_vec` | **41.21 ns** | ~24.3M records/sec |
 
@@ -218,7 +218,7 @@ The benchmark uses a **341-byte CBOR payload** with 12 top-level fields covering
   │ In-place sets      │ ~118-155M ops/s │ Zero-alloc overwrites│
   │ String splice      │ ~36-85M ops/s   │ Buffer resize        │
   │ Add/Remove field   │ ~5-7M ops/s     │ Full rebuild         │
-  │ Full serialize     │ ~158-160K recs/s│ CBOR parse + layout  │
+  │ Full serialize     │ ~250-260K recs/s│ CBOR parse + layout  │
   └─────────────────────────────────────────────────────────────┘
 ```
 
