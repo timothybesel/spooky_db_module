@@ -1,8 +1,9 @@
 #[path = "data/cbor_flat_map.rs"]
 pub mod cbor_flat_map;
 use criterion::{Criterion, criterion_group, criterion_main};
-use spooky_db_module::spooky_record_mut::SpookyRecordMut;
-use spooky_db_module::spooky_record_old::SpookyRecord;
+use spooky_db_module::serialization::{from_bytes, from_spooky, serialize_into};
+use spooky_db_module::spooky_record::record_mut::SpookyRecordMut;
+use spooky_db_module::spooky_record::{SpookyReadable, SpookyRecord};
 use spooky_db_module::spooky_value::SpookyValue;
 use std::hint::black_box;
 
@@ -71,7 +72,14 @@ fn make_spooky_value() -> SpookyValue {
 
 /// Get a pre-serialized binary buffer for reading/mutation benchmarks.
 fn make_binary() -> Vec<u8> {
-    SpookyRecord::serialize(&make_spooky_value()).unwrap()
+    let (buf, _fc) = from_spooky(&make_spooky_value()).unwrap();
+    buf
+}
+
+/// Create a SpookyRecordMut from a binary buffer.
+fn make_record_mut(binary: &[u8]) -> SpookyRecordMut {
+    let (_, fc) = from_bytes(binary).unwrap();
+    SpookyRecordMut::new(binary.to_vec(), fc)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -81,23 +89,13 @@ fn make_binary() -> Vec<u8> {
 fn bench_creating_spooky_record(c: &mut Criterion) {
     let mut group = c.benchmark_group("creating_spooky_record");
 
-    // 1a. Full pipeline: CBOR → SpookyValue → SpookyRecord::serialize
-    group.bench_function("SpookyRecord::serialize", |b| {
+    // 1a. Full pipeline: CBOR → SpookyValue → from_spooky
+    group.bench_function("from_spooky", |b| {
         b.iter(|| {
             let cbor_val: cbor4ii::core::Value =
                 cbor4ii::serde::from_slice(black_box(BENCH_CBOR)).unwrap();
             let sv = SpookyValue::from(cbor_val);
-            SpookyRecord::serialize(black_box(&sv)).unwrap()
-        })
-    });
-
-    // 1b. Full pipeline: CBOR → SpookyValue → SpookyRecordMut::from_spooky_value
-    group.bench_function("SpookyRecordMut::from_spooky_value", |b| {
-        b.iter(|| {
-            let cbor_val: cbor4ii::core::Value =
-                cbor4ii::serde::from_slice(black_box(BENCH_CBOR)).unwrap();
-            let sv = SpookyValue::from(cbor_val);
-            SpookyRecordMut::from_spooky_value(black_box(&sv)).unwrap()
+            from_spooky(black_box(&sv)).unwrap()
         })
     });
 
@@ -106,10 +104,14 @@ fn bench_creating_spooky_record(c: &mut Criterion) {
         b.iter(|| SpookyRecordMut::new_empty())
     });
 
-    // 3. SpookyRecordMut::from_vec
+    // 3. SpookyRecordMut from existing bytes
     let binary = make_binary();
-    group.bench_function("SpookyRecordMut::from_vec", |b| {
-        b.iter(|| SpookyRecordMut::from_vec(black_box(binary.clone())).unwrap())
+    group.bench_function("SpookyRecordMut::new (from bytes)", |b| {
+        b.iter(|| {
+            let bin = black_box(binary.clone());
+            let (_, fc) = from_bytes(&bin).unwrap();
+            SpookyRecordMut::new(bin, fc)
+        })
     });
 
     group.finish();
@@ -125,8 +127,9 @@ fn bench_reading_values(c: &mut Criterion) {
     group.measurement_time(std::time::Duration::from_secs(8));
 
     let binary = make_binary();
-    let record = SpookyRecord::from_bytes(&binary).unwrap();
-    let mut_record = SpookyRecordMut::from_vec(binary.clone()).unwrap();
+    let (buf_ref, fc) = from_bytes(&binary).unwrap();
+    let record = SpookyRecord::new(buf_ref, fc);
+    let mut_record = make_record_mut(&binary);
 
     // ── SpookyRecord (immutable) getters ──
 
@@ -188,7 +191,7 @@ fn bench_set_values(c: &mut Criterion) {
 
     // Helper: create a record with extra typed fields for benchmarking
     let make_typed_record = || -> SpookyRecordMut {
-        let mut rec = SpookyRecordMut::from_vec(binary.clone()).unwrap();
+        let mut rec = make_record_mut(&binary);
         // Add fields of each type so we can benchmark set_* on matching types
         rec.add_field("bench_u64", &SpookyValue::from(100u64))
             .unwrap();
@@ -267,7 +270,7 @@ fn bench_field_migration(c: &mut Criterion) {
 
     group.bench_function("add_field", |b| {
         b.iter_batched(
-            || SpookyRecordMut::from_vec(binary.clone()).unwrap(),
+            || make_record_mut(&binary),
             |mut rec| {
                 rec.add_field(
                     black_box("new_bench_field"),
@@ -281,7 +284,7 @@ fn bench_field_migration(c: &mut Criterion) {
 
     group.bench_function("remove_field", |b| {
         b.iter_batched(
-            || SpookyRecordMut::from_vec(binary.clone()).unwrap(),
+            || make_record_mut(&binary),
             |mut rec| {
                 rec.remove_field(black_box("name")).unwrap();
             },
@@ -305,7 +308,7 @@ fn bench_fieldslot(c: &mut Criterion) {
     group.warm_up_time(std::time::Duration::from_secs(3));
 
     let binary = make_binary();
-    let mut rec = SpookyRecordMut::from_vec(binary.clone()).unwrap();
+    let mut rec = make_record_mut(&binary);
 
     // Resolve slots up-front
     let age_slot = rec.resolve("age").unwrap();
@@ -372,41 +375,27 @@ fn bench_fieldslot(c: &mut Criterion) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Group 6: Buffer Reuse — serialize_into vs serialize
+// Group 6: Buffer Reuse — serialize_into vs from_spooky
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn bench_buffer_reuse(c: &mut Criterion) {
     let mut group = c.benchmark_group("buffer_reuse");
 
     let value = make_spooky_value();
+    let map = match &value {
+        SpookyValue::Object(m) => m,
+        _ => panic!("Expected object"),
+    };
 
-    // ── SpookyRecord::serialize vs serialize_into ──
+    // ── from_spooky (fresh alloc) vs serialize_into (reuse) ──
 
-    group.bench_function("serialize (fresh alloc)", |b| {
-        b.iter(|| SpookyRecord::serialize(black_box(&value)).unwrap())
+    group.bench_function("from_spooky (fresh alloc)", |b| {
+        b.iter(|| from_spooky(black_box(&value)).unwrap())
     });
 
     group.bench_function("serialize_into (reuse)", |b| {
         let mut buf = Vec::new();
-        b.iter(|| SpookyRecord::serialize_into(black_box(&value), &mut buf).unwrap())
-    });
-
-    // ── SpookyRecordMut::from_spooky_value vs from_spooky_value_into ──
-
-    group.bench_function("from_spooky_value (fresh alloc)", |b| {
-        b.iter(|| SpookyRecordMut::from_spooky_value(black_box(&value)).unwrap())
-    });
-
-    group.bench_function("from_spooky_value_into (reuse)", |b| {
-        b.iter_batched(
-            || {
-                SpookyRecordMut::from_spooky_value(&value)
-                    .unwrap()
-                    .into_bytes()
-            },
-            |buf| SpookyRecordMut::from_spooky_value_into(black_box(&value), buf).unwrap(),
-            criterion::BatchSize::SmallInput,
-        )
+        b.iter(|| serialize_into(black_box(map), &mut buf).unwrap())
     });
 
     group.finish();
