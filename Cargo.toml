@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cbor4ii = { version = "1.2.2", features = ["serde1", "use_alloc"] }
+arrayvec = "0.7.6"
+cbor4ii = { version = "1.2.2", features = ["use_alloc", "serde1", "use_std"] }
 
 redb = "3.1.0"
 rustc-hash = "2.1.1"
