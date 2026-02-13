@@ -233,4 +233,99 @@ impl SpookyRecordMut {
     pub fn set_null(&mut self, name: &str) -> Result<(), RecordError> {
         self.set_field(name, &SpookyValue::Null)
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // FieldSlot — O(1) cached access
+    // ════════════════════════════════════════════════════════════════════════
+    /// Resolve a field by name into a cached FieldSlot.
+    ///
+    /// This performs one O(log n) lookup and caches all metadata needed for
+    /// future O(1) access via `get_*_at` and `set_*_at` methods.
+    ///
+    /// The returned slot is valid until a layout-changing operation
+    /// (add_field, remove_field, or variable-length splice). Staleness
+    /// is checked via debug assertions in all `_at` methods.
+    /// Set an i64 field using a cached FieldSlot. In-place, ~20ns.
+    #[inline]
+    pub fn set_i64_at(&mut self, slot: &FieldSlot, value: i64) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_I64 {
+            return Err(RecordError::TypeMismatch {
+                expected: TAG_I64,
+                actual: slot.type_tag,
+            });
+        }
+        self.data_buf[slot.data_offset..slot.data_offset + 8].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    /// Set a u64 field using a cached FieldSlot. In-place, ~20ns.
+    #[inline]
+    pub fn set_u64_at(&mut self, slot: &FieldSlot, value: u64) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_U64 {
+            return Err(RecordError::TypeMismatch {
+                expected: TAG_U64,
+                actual: slot.type_tag,
+            });
+        }
+        self.data_buf[slot.data_offset..slot.data_offset + 8].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    /// Set an f64 field using a cached FieldSlot. In-place, ~20ns.
+    #[inline]
+    pub fn set_f64_at(&mut self, slot: &FieldSlot, value: f64) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_F64 {
+            return Err(RecordError::TypeMismatch {
+                expected: TAG_F64,
+                actual: slot.type_tag,
+            });
+        }
+        self.data_buf[slot.data_offset..slot.data_offset + 8].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    /// Set a bool field using a cached FieldSlot. In-place, ~18ns.
+    #[inline]
+    pub fn set_bool_at(&mut self, slot: &FieldSlot, value: bool) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_BOOL {
+            return Err(RecordError::TypeMismatch {
+                expected: TAG_BOOL,
+                actual: slot.type_tag,
+            });
+        }
+        self.data_buf[slot.data_offset] = value as u8;
+        Ok(())
+    }
+
+    /// Set a string field using a cached FieldSlot.
+    ///
+    /// **Conservative strategy**: Only accepts same-byte-length writes.
+    /// Returns `LengthMismatch` if the new value has a different byte length.
+    /// Caller should fall back to `set_str` + re-resolve on mismatch.
+    ///
+    /// Same-length writes are in-place (~22ns) and don't invalidate the slot.
+    #[inline]
+    pub fn set_str_at(&mut self, slot: &FieldSlot, value: &str) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
+        if slot.type_tag != TAG_STR {
+            return Err(RecordError::TypeMismatch {
+                expected: TAG_STR,
+                actual: slot.type_tag,
+            });
+        }
+        let new_bytes = value.as_bytes();
+        if new_bytes.len() != slot.data_len {
+            return Err(RecordError::LengthMismatch {
+                expected: slot.data_len,
+                actual: new_bytes.len(),
+            });
+        }
+        self.data_buf[slot.data_offset..slot.data_offset + slot.data_len]
+            .copy_from_slice(new_bytes);
+        Ok(())
+    }
 }

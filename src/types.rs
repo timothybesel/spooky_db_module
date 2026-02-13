@@ -62,7 +62,7 @@ pub struct FieldSlot {
     pub(crate) data_offset: usize,
     pub(crate) data_len: usize, // consistent with IndexEntry
     pub(crate) type_tag: u8,
-    pub(crate) generation: u32,
+    pub(crate) generation: usize,
 }
 
 // ─── Iterator ───────────────────────────────────────────────────────────────

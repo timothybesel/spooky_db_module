@@ -2,7 +2,6 @@ pub mod error;
 //pub mod spooky_record;
 //pub mod spooky_record_mut;
 pub mod deserialization;
-pub mod record_mut;
 pub mod serialization;
 pub mod spooky_record;
 pub mod spooky_value;

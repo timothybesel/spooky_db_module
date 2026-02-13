@@ -11,7 +11,7 @@ pub struct SpookyRecordMut {
 }
 
 impl SpookyRecordMut {
-    fn new(data_buf: Vec<u8>, field_count: usize) -> Self {
+    pub fn new(data_buf: Vec<u8>, field_count: usize) -> Self {
         Self {
             data_buf,
             field_count,
@@ -53,14 +53,16 @@ impl SpookyRecordMut {
 }
 
 impl SpookyReadable for SpookyRecordMut {
+    #[inline]
     fn data_buf(&self) -> &[u8] {
         &self.data_buf.as_ref()
     }
-
+    #[inline]
     fn field_count(&self) -> usize {
         self.field_count
     }
 
+    #[inline]
     fn iter_fields(&self) -> FieldIter<'_> {
         let view = SpookyRecord {
             data_buf: &self.data_buf,
@@ -71,5 +73,10 @@ impl SpookyReadable for SpookyRecordMut {
             record: view,
             pos: 0,
         }
+    }
+
+    #[inline]
+    fn generation(&self) -> usize {
+        self.generation
     }
 }
