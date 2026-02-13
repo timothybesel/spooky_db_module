@@ -369,6 +369,25 @@ pub fn from_spooky(data: &SpookyValue) -> Result<(Vec<u8>, usize), RecordError> 
     Ok((buf, field_count))
 }
 
+/// Serialize a cbor4ii::core::Value::Map into the hybrid binary format.
+pub fn from_cbor(data: &cbor4ii::core::Value) -> Result<(Vec<u8>, usize), RecordError> {
+    let entries = match data {
+        cbor4ii::core::Value::Map(entries) => entries,
+        _ => return Err(RecordError::InvalidBuffer),
+    };
+
+    let mut map = BTreeMap::new();
+    for (k, v) in entries {
+        let key_str = match k {
+            cbor4ii::core::Value::Text(s) => SmolStr::from(s),
+            _ => return Err(RecordError::CborError("Key must be a string".into())),
+        };
+        map.insert(key_str, v.clone());
+    }
+
+    serialize(&map)
+}
+
 /// Create a mutable record by taking ownership of an existing serialized buffer.
 ///
 /// The buffer **must** have a sorted index (produced by `serialize_record()`,

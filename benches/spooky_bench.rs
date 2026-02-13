@@ -1,7 +1,7 @@
 #[path = "data/cbor_flat_map.rs"]
 pub mod cbor_flat_map;
 use criterion::{Criterion, criterion_group, criterion_main};
-use spooky_db_module::serialization::{from_bytes, from_spooky, serialize_into};
+use spooky_db_module::serialization::{from_bytes, from_cbor, from_spooky, serialize_into};
 use spooky_db_module::spooky_record::record_mut::SpookyRecordMut;
 use spooky_db_module::spooky_record::{SpookyReadable, SpookyRecord};
 use spooky_db_module::spooky_value::SpookyValue;
@@ -72,7 +72,8 @@ fn make_spooky_value() -> SpookyValue {
 
 /// Get a pre-serialized binary buffer for reading/mutation benchmarks.
 fn make_binary() -> Vec<u8> {
-    let (buf, _fc) = from_spooky(&make_spooky_value()).unwrap();
+    let cbor_val: cbor4ii::core::Value = cbor4ii::serde::from_slice(black_box(BENCH_CBOR)).unwrap();
+    let (buf, _fc) = from_cbor(&cbor_val).unwrap();
     buf
 }
 
@@ -94,8 +95,7 @@ fn bench_creating_spooky_record(c: &mut Criterion) {
         b.iter(|| {
             let cbor_val: cbor4ii::core::Value =
                 cbor4ii::serde::from_slice(black_box(BENCH_CBOR)).unwrap();
-            let sv = SpookyValue::from(cbor_val);
-            from_spooky(black_box(&sv)).unwrap()
+            from_cbor(black_box(&cbor_val)).unwrap()
         })
     });
 
