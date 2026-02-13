@@ -36,7 +36,7 @@ impl SpookyRecordMut {
     }
 
     /// Find the sorted insertion position for a new hash.
-    fn find_insert_pos(&self, hash: u64) -> usize {
+    pub fn find_insert_pos(&self, hash: u64) -> usize {
         let n = self.field_count as usize;
         let mut lo = 0usize;
         let mut hi = n;

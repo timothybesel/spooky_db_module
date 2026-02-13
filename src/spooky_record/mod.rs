@@ -1,3 +1,4 @@
+pub mod migration_op;
 mod read_op;
 pub mod record;
 pub mod record_mut;
