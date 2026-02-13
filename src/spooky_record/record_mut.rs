@@ -80,3 +80,30 @@ impl SpookyReadable for SpookyRecordMut {
         self.generation
     }
 }
+
+
+
+/* TODO: There are currently missing methods:
+    // ════════════════════════════════════════════════════════════════════════
+    // Finalize
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Consume and return the underlying buffer. Use this to write to redb.
+    #[inline]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buf
+    }
+
+    /// Borrow the underlying buffer.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Total byte size of the record.
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.buf.len()
+    }
+}
+*/
