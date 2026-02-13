@@ -207,6 +207,11 @@ impl<'a> SpookyRecord<'a> {
         let index_size = field_count * INDEX_ENTRY_SIZE;
         let data_start = HEADER_SIZE + index_size;
 
+        // Reuse buffer — clears but retains capacity
+        buf.clear();
+        buf.reserve(data_start + field_count * 16);
+        buf.resize(data_start, 0);
+
         // Collect hashes, sort by hash
         let mut entries: Vec<(&smol_str::SmolStr, &SpookyValue, u64)> =
             Vec::with_capacity(field_count);
@@ -216,11 +221,6 @@ impl<'a> SpookyRecord<'a> {
             entries.push((key, value, hash));
         }
         entries.sort_unstable_by_key(|(_, _, hash)| *hash);
-
-        // Reuse buffer — clears but retains capacity
-        buf.clear();
-        buf.reserve(data_start + field_count * 16);
-        buf.resize(data_start, 0);
 
         // Write header
         buf[0..4].copy_from_slice(&(field_count as u32).to_le_bytes());

@@ -161,7 +161,7 @@ impl SpookyRecordMut {
     ///
     /// Identical to `from_spooky_value`, but reuses the caller's Vec to eliminate
     /// allocations when building many records in sequence. The buffer is cleared
-   /// but retains its capacity.
+    /// but retains its capacity.
     ///
     /// Produces a sorted index.
     pub fn from_spooky_value_into(
@@ -977,8 +977,7 @@ impl SpookyRecordMut {
                 actual: new_bytes.len(),
             });
         }
-        self.buf[slot.data_offset..slot.data_offset + slot.data_length]
-            .copy_from_slice(new_bytes);
+        self.buf[slot.data_offset..slot.data_offset + slot.data_length].copy_from_slice(new_bytes);
         Ok(())
     }
 
@@ -1498,14 +1497,14 @@ mod tests {
     #[test]
     fn test_resolve_and_get_at() {
         let rec = make_record_mut();
-        
+
         // Resolve all fields
         let id_slot = rec.resolve("id").expect("id exists");
         let age_slot = rec.resolve("age").expect("age exists");
         let score_slot = rec.resolve("score").expect("score exists");
         let active_slot = rec.resolve("active").expect("active exists");
         let level_slot = rec.resolve("level").expect("level exists");
-        
+
         // Read via slots - should match by-name accessors
         assert_eq!(rec.get_str_at(&id_slot), Some("user:123"));
         assert_eq!(rec.get_i64_at(&age_slot), Some(30));
@@ -1517,24 +1516,24 @@ mod tests {
     #[test]
     fn test_set_at_fixed_width() {
         let mut rec = make_record_mut();
-        
+
         let age_slot = rec.resolve("age").unwrap();
         let score_slot = rec.resolve("score").unwrap();
         let active_slot = rec.resolve("active").unwrap();
         let level_slot = rec.resolve("level").unwrap();
-        
+
         // Mutate via slots
         rec.set_i64_at(&age_slot, 31).unwrap();
         rec.set_f64_at(&score_slot, 100.0).unwrap();
         rec.set_bool_at(&active_slot, false).unwrap();
         rec.set_u64_at(&level_slot, 43).unwrap();
-        
+
         // Read back
         assert_eq!(rec.get_i64_at(&age_slot), Some(31));
         assert_eq!(rec.get_f64_at(&score_slot), Some(100.0));
         assert_eq!(rec.get_bool_at(&active_slot), Some(false));
         assert_eq!(rec.get_u64_at(&level_slot), Some(43));
-        
+
         // Slots should still be valid (generation didn't change)
         assert_eq!(rec.get_i64("age"), Some(31));
     }
@@ -1543,11 +1542,11 @@ mod tests {
     fn test_set_str_at_same_length() {
         let mut rec = make_record_mut();
         let name_slot = rec.resolve("name").unwrap();
-        
+
         // "Alice" is 5 bytes, "Carol" is also 5 bytes
         rec.set_str_at(&name_slot, "Carol").unwrap();
         assert_eq!(rec.get_str_at(&name_slot), Some("Carol"));
-        
+
         // Slot still valid
         assert_eq!(rec.get_str("name"), Some("Carol"));
     }
@@ -1556,7 +1555,7 @@ mod tests {
     fn test_set_str_at_length_mismatch() {
         let mut rec = make_record_mut();
         let name_slot = rec.resolve("name").unwrap();
-        
+
         // "Alice" is 5 bytes, "Bob" is 3 bytes
         let result = rec.set_str_at(&name_slot, "Bob");
         assert!(matches!(result, Err(RecordError::LengthMismatch { .. })));
@@ -1566,15 +1565,15 @@ mod tests {
     fn test_generation_bump_on_splice() {
         let mut rec = make_record_mut();
         let old_gen = rec.generation;
-        
+
         // Resolve slot
         let name_slot = rec.resolve("name").unwrap();
         assert_eq!(name_slot.generation, old_gen);
-        
+
         // Splice triggers generation bump (different length)
         rec.set_str("name", "Alexander").unwrap();
         assert_eq!(rec.generation, old_gen + 1);
-        
+
         // Re-resolve to get fresh slot
         let new_slot = rec.resolve("name").unwrap();
         assert_eq!(new_slot.generation, old_gen + 1);
@@ -1585,15 +1584,15 @@ mod tests {
     fn test_generation_bump_on_add_remove() {
         let mut rec = make_record_mut();
         let old_gen = rec.generation;
-        
+
         let age_slot = rec.resolve("age").unwrap();
         assert_eq!(age_slot.generation, old_gen);
-        
+
         // add_field bumps generation
         rec.add_field("email", &SpookyValue::from("test@example.com"))
             .unwrap();
         assert_eq!(rec.generation, old_gen + 1);
-        
+
         // remove_field bumps again
         rec.remove_field("email").unwrap();
         assert_eq!(rec.generation, old_gen + 2);
@@ -1605,11 +1604,11 @@ mod tests {
     fn test_stale_slot_debug_panic() {
         let mut rec = make_record_mut();
         let age_slot = rec.resolve("age").unwrap();
-        
+
         // Invalidate the slot by adding a field
         rec.add_field("email", &SpookyValue::from("test@test.com"))
             .unwrap();
-        
+
         // This should panic in debug mode
         let _ = rec.get_i64_at(&age_slot);
     }
@@ -1626,9 +1625,9 @@ mod tests {
     fn test_serialize_into_roundtrip() {
         let value = make_test_value();
         let mut buf = Vec::new();
-        
+
         SpookyRecord::serialize_into(&value, &mut buf).unwrap();
-        
+
         let rec = SpookyRecord::from_bytes(&buf).unwrap();
         assert_eq!(rec.field_count(), 6);
         assert_eq!(rec.get_str("id"), Some("user:123"));
@@ -1643,25 +1642,25 @@ mod tests {
         map_b.insert(SmolStr::from("x"), SpookyValue::from(100i64));
         map_b.insert(SmolStr::from("y"), SpookyValue::from(200i64));
         let value_b = SpookyValue::Object(map_b);
-        
+
         let mut buf = Vec::new();
-        
+
         // Serialize record A
         SpookyRecord::serialize_into(&value_a, &mut buf).unwrap();
         let cap_after_a = buf.capacity();
-        
+
         // Serialize record B into same buffer
         SpookyRecord::serialize_into(&value_b, &mut buf).unwrap();
-        
+
         // Buffer should be reused (capacity shouldn't decrease)
         assert!(buf.capacity() >= cap_after_a);
-        
+
         // Verify B's data is correct
         let rec_b = SpookyRecord::from_bytes(&buf).unwrap();
         assert_eq!(rec_b.field_count(), 2);
         assert_eq!(rec_b.get_i64("x"), Some(100));
         assert_eq!(rec_b.get_i64("y"), Some(200));
-        
+
         // A's data should be gone
         assert_eq!(rec_b.get_str("id"), None);
     }
@@ -1670,9 +1669,9 @@ mod tests {
     fn test_from_spooky_value_into_roundtrip() {
         let value = make_test_value();
         let buf = Vec::new();
-        
+
         let rec = SpookyRecordMut::from_spooky_value_into(&value, buf).unwrap();
-        
+
         assert_eq!(rec.field_count(), 6);
         assert_eq!(rec.get_str("id"), Some("user:123"));
         assert_eq!(rec.get_i64("age"), Some(30));
@@ -1682,26 +1681,26 @@ mod tests {
     #[test]
     fn test_from_spooky_value_into_reuse() {
         let value_a = make_test_value();
-        
+
         let mut map_b = FastMap::new();
         map_b.insert(SmolStr::from("foo"), SpookyValue::from(777i64));
         let value_b = SpookyValue::Object(map_b);
-        
+
         // Build record A
         let rec_a = SpookyRecordMut::from_spooky_value(&value_a).unwrap();
         let buf_a = rec_a.into_bytes();
         let cap_after_a = buf_a.capacity();
-        
+
         // Reuse that buffer for record B
         let rec_b = SpookyRecordMut::from_spooky_value_into(&value_b, buf_a).unwrap();
-        
+
         // Buffer should be reused
-        assert!(rec_b.byte_len()  <= cap_after_a);
-        
+        assert!(rec_b.byte_len() <= cap_after_a);
+
         // Verify B is correct
         assert_eq!(rec_b.field_count(), 1);
         assert_eq!(rec_b.get_i64("foo"), Some(777));
-        
+
         // A's data should be gone
         assert_eq!(rec_b.get_str("id"), None);
     }
