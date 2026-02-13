@@ -248,7 +248,6 @@ impl SpookyRecordMut {
     /// Set an i64 field using a cached FieldSlot. In-place, ~20ns.
     #[inline]
     pub fn set_i64_at(&mut self, slot: &FieldSlot, value: i64) -> Result<(), RecordError> {
-        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
         if slot.type_tag != TAG_I64 {
             return Err(RecordError::TypeMismatch {
                 expected: TAG_I64,
@@ -262,7 +261,6 @@ impl SpookyRecordMut {
     /// Set a u64 field using a cached FieldSlot. In-place, ~20ns.
     #[inline]
     pub fn set_u64_at(&mut self, slot: &FieldSlot, value: u64) -> Result<(), RecordError> {
-        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
         if slot.type_tag != TAG_U64 {
             return Err(RecordError::TypeMismatch {
                 expected: TAG_U64,
