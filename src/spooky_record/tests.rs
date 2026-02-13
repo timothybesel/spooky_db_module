@@ -74,7 +74,7 @@ mod spooky_record_tests {
         assert!(record.get_u64("anything").is_none());
         assert!(record.get_bool("anything").is_none());
         assert!(record.get_raw("anything").is_none());
-        assert!(record.get_field("anything").is_none());
+        assert!(record.get_field::<SpookyValue>("anything").is_none());
         assert!(record.get_number_as_f64("anything").is_none());
         assert!(record.field_type("anything").is_none());
         assert_eq!(record.iter_fields().count(), 0);
@@ -152,7 +152,7 @@ mod spooky_record_tests {
         let record = SpookyRecord::new(&buf, fc);
 
         assert_eq!(record.field_type("x"), Some(TAG_NULL));
-        assert_eq!(record.get_field("x"), Some(SpookyValue::Null));
+        assert_eq!(record.get_field::<SpookyValue>("x"), Some(SpookyValue::Null));
         // Null must not be returned by typed getters
         assert!(record.get_str("x").is_none());
         assert!(record.get_i64("x").is_none());
@@ -239,7 +239,7 @@ mod spooky_record_tests {
         assert!(record.get_u64("nonexistent").is_none());
         assert!(record.get_f64("nonexistent").is_none());
         assert!(record.get_bool("nonexistent").is_none());
-        assert!(record.get_field("nonexistent").is_none());
+        assert!(record.get_field::<SpookyValue>("nonexistent").is_none());
         assert!(record.get_number_as_f64("nonexistent").is_none());
         assert!(!record.has_field("nonexistent"));
         assert!(record.field_type("nonexistent").is_none());
@@ -407,11 +407,11 @@ mod spooky_record_tests {
         let (buf, fc) = from_spooky(&original).unwrap();
         let record = SpookyRecord::new(&buf, fc);
 
-        assert_eq!(record.get_field("id"), Some(SpookyValue::from("user:123")));
-        assert_eq!(record.get_field("age"), Some(SpookyValue::from(30i64)));
-        assert_eq!(record.get_field("score"), Some(SpookyValue::from(99.5f64)));
-        assert_eq!(record.get_field("active"), Some(SpookyValue::from(true)));
-        assert_eq!(record.get_field("version"), Some(SpookyValue::from(42u64)));
+        assert_eq!(record.get_field::<SpookyValue>("id"), Some(SpookyValue::from("user:123")));
+        assert_eq!(record.get_field::<SpookyValue>("age"), Some(SpookyValue::from(30i64)));
+        assert_eq!(record.get_field::<SpookyValue>("score"), Some(SpookyValue::from(99.5f64)));
+        assert_eq!(record.get_field::<SpookyValue>("active"), Some(SpookyValue::from(true)));
+        assert_eq!(record.get_field::<SpookyValue>("version"), Some(SpookyValue::from(42u64)));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -429,7 +429,7 @@ mod spooky_record_tests {
         let (buf, fc) = from_spooky(&obj).unwrap();
         let record = SpookyRecord::new(&buf, fc);
 
-        let addr = record.get_field("address").unwrap();
+        let addr = record.get_field::<SpookyValue>("address").unwrap();
         assert_eq!(addr.get("city").and_then(|v| v.as_str()), Some("Berlin"));
     }
 
@@ -449,7 +449,7 @@ mod spooky_record_tests {
         let (buf, fc) = from_spooky(&obj).unwrap();
         let record = SpookyRecord::new(&buf, fc);
 
-        let tags = record.get_field("tags").unwrap();
+        let tags = record.get_field::<SpookyValue>("tags").unwrap();
         let arr = tags.as_array().unwrap();
         assert_eq!(arr.len(), 3);
     }
@@ -463,7 +463,7 @@ mod spooky_record_tests {
         let (buf, fc) = from_spooky(&obj).unwrap();
         let record = SpookyRecord::new(&buf, fc);
 
-        let val = record.get_field("empty").unwrap();
+        let val = record.get_field::<SpookyValue>("empty").unwrap();
         assert_eq!(val.as_array().unwrap().len(), 0);
     }
 
@@ -476,7 +476,7 @@ mod spooky_record_tests {
         let (buf, fc) = from_spooky(&obj).unwrap();
         let record = SpookyRecord::new(&buf, fc);
 
-        let val = record.get_field("obj").unwrap();
+        let val = record.get_field::<SpookyValue>("obj").unwrap();
         assert!(val.as_object().unwrap().is_empty());
     }
 
@@ -495,7 +495,7 @@ mod spooky_record_tests {
         let (buf, fc) = from_spooky(&obj).unwrap();
         let record = SpookyRecord::new(&buf, fc);
 
-        let l1 = record.get_field("l1").unwrap();
+        let l1 = record.get_field::<SpookyValue>("l1").unwrap();
         let l2 = l1.get("l2").unwrap();
         let l3 = l2.get("l3").unwrap();
         assert_eq!(l3.get("deep").and_then(|v| v.as_str()), Some("value"));
@@ -519,7 +519,7 @@ mod spooky_record_tests {
         assert_eq!(record.get_str("flat_str"), Some("hello"));
         assert_eq!(record.get_i64("flat_num"), Some(7));
         assert_eq!(record.get_bool("flat_bool"), Some(false));
-        let arr = record.get_field("nested").unwrap();
+        let arr = record.get_field::<SpookyValue>("nested").unwrap();
         assert_eq!(arr.as_array().unwrap().len(), 2);
         // Typed getters must not return nested CBOR
         assert!(record.get_str("nested").is_none());
@@ -538,7 +538,7 @@ mod spooky_record_tests {
 
         let (buf, fc) = from_spooky(&obj).unwrap();
         let record = SpookyRecord::new(&buf, fc);
-        assert_eq!(record.get_field("nothing"), Some(SpookyValue::Null));
+        assert_eq!(record.get_field::<SpookyValue>("nothing"), Some(SpookyValue::Null));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1160,7 +1160,7 @@ mod spooky_record_mut_tests {
         let obj = SpookyValue::Object(inner);
 
         rec.set_field("name", &obj).unwrap();
-        let result = rec.get_field("name").unwrap();
+        let result = rec.get_field::<SpookyValue>("name").unwrap();
         assert_eq!(result.get("city").and_then(|v| v.as_str()), Some("Berlin"));
         assert_eq!(rec.get_i64("age"), Some(30));
     }
@@ -1403,7 +1403,7 @@ mod spooky_record_mut_tests {
         let mut rec = make_record_mut();
         rec.add_field("nothing", &SpookyValue::Null).unwrap();
         assert_eq!(rec.field_type("nothing"), Some(TAG_NULL));
-        assert_eq!(rec.get_field("nothing"), Some(SpookyValue::Null));
+        assert_eq!(rec.get_field::<SpookyValue>("nothing"), Some(SpookyValue::Null));
     }
 
     // ── Phase 1: FieldSlot Tests ───────────────────────────────────────────

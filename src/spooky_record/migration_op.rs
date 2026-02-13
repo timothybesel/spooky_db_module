@@ -2,7 +2,6 @@ use super::read_op::SpookyReadable;
 use super::record_mut::SpookyRecordMut;
 use crate::error::RecordError;
 use crate::serialization::write_field_into;
-use crate::spooky_value::SpookyValue;
 use crate::types::*;
 use xxhash_rust::xxh64::xxh64;
 
@@ -16,7 +15,7 @@ impl SpookyRecordMut {
     /// Rebuilds the buffer with the new field inserted at the correct
     /// sorted position. This is simpler and less error-prone than in-place
     /// index insertion with offset fixups.
-    pub fn add_field(&mut self, name: &str, value: &SpookyValue) -> Result<(), RecordError> {
+    pub fn add_field<V: crate::serialization::RecordSerialize>(&mut self, name: &str, value: &V) -> Result<(), RecordError> {
         let hash = xxh64(name.as_bytes(), 0);
 
         if self.find_field(name).is_ok() {

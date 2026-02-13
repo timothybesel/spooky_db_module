@@ -134,7 +134,7 @@ fn bench_reading_values(c: &mut Criterion) {
     // ── SpookyRecord (immutable) getters ──
 
     group.bench_function("SpookyRecord::get_field", |b| {
-        b.iter(|| black_box(record.get_field(black_box("name"))))
+        b.iter(|| black_box(record.get_field::<SpookyValue>(black_box("name"))))
     });
 
     group.bench_function("SpookyRecord::get_str", |b| {
@@ -152,7 +152,7 @@ fn bench_reading_values(c: &mut Criterion) {
     // ── SpookyRecordMut getters ──
 
     group.bench_function("SpookyRecordMut::get_field", |b| {
-        b.iter(|| black_box(mut_record.get_field(black_box("name"))))
+        b.iter(|| black_box(mut_record.get_field::<SpookyValue>(black_box("name"))))
     });
 
     group.bench_function("SpookyRecordMut::get_str", |b| {

@@ -1,4 +1,3 @@
-use crate::deserialization::decode_field;
 use crate::error::RecordError;
 use crate::spooky_value::SpookyValue;
 use crate::types::*;
@@ -171,11 +170,12 @@ pub trait SpookyReadable {
     }
 
     ///TODO: make it generic
-    /// Get any field as a SpookyValue (deserializes nested CBOR if needed).
+    /// Get any field as a value (deserializes nested CBOR if needed).
+    /// Specify the value type using turbofish syntax: `get_field::<SpookyValue>("name")`.
     #[inline]
-    fn get_field(&self, name: &str) -> Option<SpookyValue> {
+    fn get_field<V: crate::deserialization::RecordDeserialize>(&self, name: &str) -> Option<V> {
         let field = self.get_raw(name)?;
-        decode_field(field)
+        crate::deserialization::decode_field(field)
     }
 
     /// Get a numeric field as f64 (converting i64/u64 if needed).

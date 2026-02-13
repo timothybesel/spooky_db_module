@@ -200,10 +200,10 @@ impl SpookyRecordMut {
     // Generic setter — handles any type/size change
     // ════════════════════════════════════════════════════════════════════════
 
-    /// Set any field to any SpookyValue. Automatically picks the optimal path:
+    /// Set any field to any value. Automatically picks the optimal path:
     /// - Same size → in-place overwrite (~25ns)
     /// - Different size → splice + offset fixup (~200-500ns)
-    pub fn set_field(&mut self, name: &str, value: &SpookyValue) -> Result<(), RecordError> {
+    pub fn set_field<V: crate::serialization::RecordSerialize>(&mut self, name: &str, value: &V) -> Result<(), RecordError> {
         let (pos, meta) = self.find_field(name)?;
         let mut new_bytes = Vec::new();
         let new_tag = write_field_into(&mut new_bytes, value)?;

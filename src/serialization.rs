@@ -6,6 +6,224 @@ use smol_str::SmolStr;
 use std::collections::BTreeMap;
 use xxhash_rust::const_xxh64::xxh64;
 
+// ─── RecordSerialize Trait ──────────────────────────────────────────────────
+
+/// Trait for value types that can be serialized into the binary record format.
+/// 
+/// This trait abstracts over different value representations (SpookyValue,
+/// serde_json::Value, cbor4ii::core::Value) allowing them to be stored in the
+/// same hybrid binary format.
+pub trait RecordSerialize: serde::Serialize {
+    /// Check if this value is null.
+    fn is_null(&self) -> bool;
+    
+    /// Extract a boolean value, if this is a boolean.
+    fn as_bool(&self) -> Option<bool>;
+    
+    /// Extract an i64 value, if this is an i64.
+    fn as_i64(&self) -> Option<i64>;
+    
+    /// Extract a u64 value, if this is a u64.
+    fn as_u64(&self) -> Option<u64>;
+    
+    /// Extract an f64 value, if this is an f64.
+    fn as_f64(&self) -> Option<f64>;
+    
+    /// Extract a string slice, if this is a string.
+    fn as_str(&self) -> Option<&str>;
+    
+    /// Check if this value is nested (array or object).
+    fn is_nested(&self) -> bool;
+}
+
+// ─── RecordSerialize for SpookyValue ────────────────────────────────────────
+
+impl RecordSerialize for SpookyValue {
+    #[inline]
+    fn is_null(&self) -> bool {
+        matches!(self, SpookyValue::Null)
+    }
+    
+    #[inline]
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            SpookyValue::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+    
+    #[inline]
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            SpookyValue::Number(SpookyNumber::I64(i)) => Some(*i),
+            _ => None,
+        }
+    }
+    
+    #[inline]
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            SpookyValue::Number(SpookyNumber::U64(u)) => Some(*u),
+            _ => None,
+        }
+    }
+    
+    #[inline]
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            SpookyValue::Number(SpookyNumber::F64(f)) => Some(*f),
+            _ => None,
+        }
+    }
+    
+    #[inline]
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            SpookyValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+    
+    #[inline]
+    fn is_nested(&self) -> bool {
+        matches!(self, SpookyValue::Array(_) | SpookyValue::Object(_))
+    }
+}
+
+// ─── RecordSerialize for serde_json::Value ──────────────────────────────────
+
+impl RecordSerialize for serde_json::Value {
+    #[inline]
+    fn is_null(&self) -> bool {
+        matches!(self, serde_json::Value::Null)
+    }
+    
+    #[inline]
+    fn as_bool(&self) -> Option<bool> {
+        self.as_bool()
+    }
+    
+    #[inline]
+    fn as_i64(&self) -> Option<i64> {
+        self.as_i64()
+    }
+    
+    #[inline]
+    fn as_u64(&self) -> Option<u64> {
+        self.as_u64()
+    }
+    
+    #[inline]
+    fn as_f64(&self) -> Option<f64> {
+        self.as_f64()
+    }
+    
+    #[inline]
+    fn as_str(&self) -> Option<&str> {
+        self.as_str()
+    }
+    
+    #[inline]
+    fn is_nested(&self) -> bool {
+        matches!(self, serde_json::Value::Array(_) | serde_json::Value::Object(_))
+    }
+}
+
+// ─── RecordSerialize for cbor4ii::core::Value ───────────────────────────────
+
+impl RecordSerialize for cbor4ii::core::Value {
+    #[inline]
+    fn is_null(&self) -> bool {
+        matches!(self, cbor4ii::core::Value::Null)
+    }
+    
+    #[inline]
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            cbor4ii::core::Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+    
+    #[inline]
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            cbor4ii::core::Value::Integer(i) => i64::try_from(*i).ok(),
+            _ => None,
+        }
+    }
+    
+    #[inline]
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            cbor4ii::core::Value::Integer(i) => u64::try_from(*i).ok(),
+            _ => None,
+        }
+    }
+    
+    #[inline]
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            cbor4ii::core::Value::Float(f) => Some(*f),
+            cbor4ii::core::Value::Integer(i) => Some(*i as f64),
+            _ => None,
+        }
+    }
+    
+    #[inline]
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            cbor4ii::core::Value::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+    
+    #[inline]
+    fn is_nested(&self) -> bool {
+        matches!(self, cbor4ii::core::Value::Array(_) | cbor4ii::core::Value::Map(_))
+    }
+}
+
+// ─── RecordSerialize for &T ─────────────────────────────────────────────────
+
+/// Blanket implementation for references — allows passing &SpookyValue, etc.
+impl<T: RecordSerialize> RecordSerialize for &T {
+    #[inline]
+    fn is_null(&self) -> bool {
+        (**self).is_null()
+    }
+    
+    #[inline]
+    fn as_bool(&self) -> Option<bool> {
+        (**self).as_bool()
+    }
+    
+    #[inline]
+    fn as_i64(&self) -> Option<i64> {
+        (**self).as_i64()
+    }
+    
+    #[inline]
+    fn as_u64(&self) -> Option<u64> {
+        (**self).as_u64()
+    }
+    
+    #[inline]
+    fn as_f64(&self) -> Option<f64> {
+        (**self).as_f64()
+    }
+    
+    #[inline]
+    fn as_str(&self) -> Option<&str> {
+        (**self).as_str()
+    }
+    
+    #[inline]
+    fn is_nested(&self) -> bool {
+        (**self).is_nested()
+    }
+}
+
 // ─── Writer ─────────────────────────────────────────────────────────────────
 
 /// Serialize a SpookyValue::Object into the hybrid binary format.
@@ -16,52 +234,61 @@ use xxhash_rust::const_xxh64::xxh64;
 
 /// Serialize a single field value into (bytes, type_tag).
 #[inline]
-pub fn write_field_into(buf: &mut Vec<u8>, value: &SpookyValue) -> Result<u8, RecordError> {
-    Ok(match value {
-        SpookyValue::Null => TAG_NULL,
-        SpookyValue::Bool(b) => {
-            buf.push(*b as u8);
-            TAG_BOOL
+pub fn write_field_into<V: RecordSerialize>(buf: &mut Vec<u8>, value: &V) -> Result<u8, RecordError> {
+    Ok(if value.is_null() {
+        TAG_NULL
+    } else if let Some(b) = value.as_bool() {
+        buf.push(b as u8);
+        TAG_BOOL
+    } else if let Some(i) = value.as_i64() {
+        // i64 — reserve once, write directly
+        buf.reserve(8);
+        let len = buf.len();
+        let bytes = i.to_le_bytes();
+        // SAFETY: we just reserved 8 bytes
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr().add(len), 8);
+            buf.set_len(len + 8);
         }
-        SpookyValue::Number(n) => {
-            // All numeric types are exactly 8 bytes — reserve once, write directly
-            buf.reserve(8);
-            let len = buf.len();
-            let bytes = match n {
-                SpookyNumber::I64(i) => {
-                    let b = i.to_le_bytes();
-                    (b, TAG_I64)
-                }
-                SpookyNumber::F64(f) => {
-                    let b = f.to_le_bytes();
-                    (b, TAG_F64)
-                }
-                SpookyNumber::U64(u) => {
-                    let b = u.to_le_bytes();
-                    (b, TAG_U64)
-                }
-            };
-            // SAFETY: we just reserved 8 bytes
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.0.as_ptr(), buf.as_mut_ptr().add(len), 8);
-                buf.set_len(len + 8);
-            }
-            bytes.1
+        TAG_I64
+    } else if let Some(u) = value.as_u64() {
+        // u64 — reserve once, write directly
+        buf.reserve(8);
+        let len = buf.len();
+        let bytes = u.to_le_bytes();
+        // SAFETY: we just reserved 8 bytes
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr().add(len), 8);
+            buf.set_len(len + 8);
         }
-        SpookyValue::Str(s) => {
-            buf.extend_from_slice(s.as_bytes());
-            TAG_STR
+        TAG_U64
+    } else if let Some(f) = value.as_f64() {
+        // f64 — reserve once, write directly
+        buf.reserve(8);
+        let len = buf.len();
+        let bytes = f.to_le_bytes();
+        // SAFETY: we just reserved 8 bytes
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr().add(len), 8);
+            buf.set_len(len + 8);
         }
-        SpookyValue::Array(_) | SpookyValue::Object(_) => {
-            cbor4ii::serde::to_writer(&mut *buf, value)
-                .map_err(|e| RecordError::CborError(e.to_string()))?;
-            TAG_NESTED_CBOR
-        }
+        TAG_F64
+    } else if let Some(s) = value.as_str() {
+        buf.extend_from_slice(s.as_bytes());
+        TAG_STR
+    } else if value.is_nested() {
+        // Array or Object — serialize as CBOR using serde::Serialize
+        cbor4ii::serde::to_writer(&mut *buf, value)
+            .map_err(|e| RecordError::CborError(e.to_string()))?;
+        TAG_NESTED_CBOR
+    } else {
+        // Unknown type — treat as null
+        TAG_NULL
     })
 }
 
-pub fn prepare_buf(
-    map: &BTreeMap<SmolStr, SpookyValue>,
+pub fn prepare_buf<V: RecordSerialize>(
+    map: &BTreeMap<SmolStr, V>,
     buf: &mut Vec<u8>,
     field_count: usize,
 ) -> Result<(), RecordError> {
@@ -69,7 +296,7 @@ pub fn prepare_buf(
     // Collect references & hashes to avoid unnecessary data copies.
     // // Stack-allocated sort buffer — no heap allocation for ≤32 fields
     // //TODO: has to be check if this could be panic in normal sitations
-    let mut entries: ArrayVec<(&SpookyValue, u64), 32> = ArrayVec::new();
+    let mut entries: ArrayVec<(&V, u64), 32> = ArrayVec::new();
 
     for (key, value) in map.iter() {
         // Compute the hash for the key
@@ -108,7 +335,7 @@ pub fn prepare_buf(
 // Serializations patterns
 // ════════════════════════════════════════════════════════════════════════
 
-pub fn serialize(map: &BTreeMap<SmolStr, SpookyValue>) -> Result<(Vec<u8>, usize), RecordError> {
+pub fn serialize<V: RecordSerialize>(map: &BTreeMap<SmolStr, V>) -> Result<(Vec<u8>, usize), RecordError> {
     let field_count = map.len();
 
     // NOTE: All arithmetic must use usize
@@ -138,7 +365,7 @@ pub fn from_spooky(data: &SpookyValue) -> Result<(Vec<u8>, usize), RecordError> 
         _ => return Err(RecordError::InvalidBuffer),
     };
 
-    let (buf, field_count) = serialize(map)?;
+    let (buf, field_count) = serialize::<SpookyValue>(map)?;
     Ok((buf, field_count))
 }
 
@@ -170,8 +397,8 @@ pub fn from_bytes(buf: &[u8]) -> Result<(&[u8], usize), RecordError> {
 /// snapshot rebuild). The buffer is cleared but retains its capacity.
 ///
 /// **IMPORTANT**: The index is sorted by name_hash.
-pub fn serialize_into(
-    map: &BTreeMap<SmolStr, SpookyValue>,
+pub fn serialize_into<V: RecordSerialize>(
+    map: &BTreeMap<SmolStr, V>,
     buf: &mut Vec<u8>,
 ) -> Result<usize, RecordError> {
     let field_count = map.len();
@@ -195,7 +422,7 @@ pub fn serialize_into_buf(data: &SpookyValue, buf: &mut Vec<u8>) -> Result<(), R
         _ => return Err(RecordError::InvalidBuffer),
     };
 
-    let _ = serialize_into(map, buf)?;
+    let _ = serialize_into::<SpookyValue>(map, buf)?;
 
     Ok(())
 }
