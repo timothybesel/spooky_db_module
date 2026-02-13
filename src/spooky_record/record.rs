@@ -15,9 +15,9 @@ impl<'a> SpookyRecord<'a> {
     // Internal: index access
     // ════════════════════════════════════════════════════════════════════════
     #[inline]
-    pub fn new(buf: &'a [u8], field_count: usize) -> Self {
+    pub fn new(data_buf: &'a [u8], field_count: usize) -> Self {
         Self {
-            data_buf: buf,
+            data_buf,
             field_count,
         }
     }

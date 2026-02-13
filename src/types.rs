@@ -1,4 +1,4 @@
-use super::spooky_record::SpookyRecord;
+use super::spooky_record::{SpookyReadable, SpookyRecord};
 
 // ─── Type Tags ──────────────────────────────────────────────────────────────
 pub const TAG_NULL: u8 = 0;

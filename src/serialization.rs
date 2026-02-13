@@ -142,6 +142,10 @@ pub fn from_spooky(data: &SpookyValue) -> Result<(Vec<u8>, usize), RecordError> 
     Ok((buf, field_count))
 }
 
+/// Create a mutable record by taking ownership of an existing serialized buffer.
+///
+/// The buffer **must** have a sorted index (produced by `serialize_record()`,
+/// `from_spooky_value()`, or a previous `into_bytes()`).
 /// Validate a byte slice and extract field_count.
 pub fn from_bytes(buf: &[u8]) -> Result<(&[u8], usize), RecordError> {
     if buf.len() < HEADER_SIZE {
