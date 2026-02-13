@@ -20,24 +20,26 @@ pub trait SpookyReadable {
         if i >= self.field_count() {
             return None;
         }
+        let buf = self.data_buf();
         let idx = HEADER_SIZE + i * INDEX_ENTRY_SIZE;
-        let name_ptr = self.data_buf()[idx..idx + 8].as_ptr() as *const u64;
-        let offset_ptr = self.data_buf()[idx + 8..idx + 12].as_ptr() as *const u32;
-        let length_ptr = self.data_buf()[idx + 12..idx + 16].as_ptr() as *const u32;
+        let name_ptr = buf[idx..idx + 8].as_ptr() as *const u64;
+        let offset_ptr = buf[idx + 8..idx + 12].as_ptr() as *const u32;
+        let length_ptr = buf[idx + 12..idx + 16].as_ptr() as *const u32;
 
         Some(IndexEntry {
             name_hash: u64::from_le(unsafe { name_ptr.read_unaligned() }),
             data_offset: u32::from_le(unsafe { offset_ptr.read_unaligned() }) as usize,
             data_len: u32::from_le(unsafe { length_ptr.read_unaligned() }) as usize,
-            type_tag: self.data_buf()[idx + 16],
+            type_tag: buf[idx + 16],
         })
     }
 
     #[inline]
     fn read_hash(&self, i: usize) -> u64 {
+        let buf = self.data_buf();
         let idx = HEADER_SIZE + i * INDEX_ENTRY_SIZE;
         // SAFETY: caller ensures i < field_count, validated at construction
-        let ptr = self.data_buf()[idx..].as_ptr() as *const u64;
+        let ptr = buf[idx..].as_ptr() as *const u64;
         u64::from_le(unsafe { ptr.read_unaligned() })
     }
 
@@ -51,9 +53,10 @@ pub trait SpookyReadable {
                     .ok_or(RecordError::InvalidBuffer);
             }
         }
-        return Err(RecordError::FieldNotFound);
+        Err(RecordError::FieldNotFound)
     }
 
+    #[inline]
     fn binary_hash_search(&self, n: usize, hash: u64) -> Result<(usize, IndexEntry), RecordError> {
         // Binary search on sorted hashes
         let mut lo = 0usize;
@@ -74,6 +77,7 @@ pub trait SpookyReadable {
     }
 
     /// Find a field by name. Returns (index_position, IndexEntry).
+    #[inline]
     fn find_field(&self, name: &str) -> Result<(usize, IndexEntry), RecordError> {
         let hash = xxh64(name.as_bytes(), 0);
         let n = self.field_count();
@@ -155,6 +159,7 @@ pub trait SpookyReadable {
     }
 
     /// Get raw field reference (zero-copy).
+    #[inline]
     fn get_raw(&self, name: &str) -> Option<FieldRef<'_>> {
         let (_, meta) = self.find_field(name).ok()?;
         let data = &self.data_buf()[meta.data_offset..meta.data_offset + meta.data_len];
@@ -167,6 +172,7 @@ pub trait SpookyReadable {
 
     ///TODO: make it generic
     /// Get any field as a SpookyValue (deserializes nested CBOR if needed).
+    #[inline]
     fn get_field(&self, name: &str) -> Option<SpookyValue> {
         let field = self.get_raw(name)?;
         decode_field(field)

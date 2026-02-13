@@ -55,7 +55,7 @@ impl SpookyRecordMut {
 impl SpookyReadable for SpookyRecordMut {
     #[inline]
     fn data_buf(&self) -> &[u8] {
-        &self.data_buf.as_ref()
+        &self.data_buf
     }
     #[inline]
     fn field_count(&self) -> usize {
