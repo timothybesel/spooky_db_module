@@ -5,29 +5,29 @@ use smol_str::SmolStr;
 // ─── RecordDeserialize Trait ────────────────────────────────────────────────
 
 /// Trait for value types that can be deserialized from the binary record format.
-/// 
+///
 /// This trait abstracts over different value representations (SpookyValue,
 /// serde_json::Value, cbor4ii::core::Value) allowing them to be reconstructed
 /// from the same hybrid binary format.
 pub trait RecordDeserialize: Sized {
     /// Construct a null value.
     fn from_null() -> Self;
-    
+
     /// Construct a boolean value.
     fn from_bool(b: bool) -> Self;
-    
+
     /// Construct an i64 value.
     fn from_i64(v: i64) -> Self;
-    
+
     /// Construct a u64 value.
     fn from_u64(v: u64) -> Self;
-    
+
     /// Construct an f64 value.
     fn from_f64(v: f64) -> Self;
-    
+
     /// Construct a string value.
     fn from_str(s: &str) -> Self;
-    
+
     /// Deserialize from CBOR bytes (for nested objects/arrays).
     fn from_cbor_bytes(data: &[u8]) -> Option<Self>;
 }
@@ -39,32 +39,32 @@ impl RecordDeserialize for SpookyValue {
     fn from_null() -> Self {
         SpookyValue::Null
     }
-    
+
     #[inline]
     fn from_bool(b: bool) -> Self {
         SpookyValue::Bool(b)
     }
-    
+
     #[inline]
     fn from_i64(v: i64) -> Self {
         SpookyValue::Number(SpookyNumber::I64(v))
     }
-    
+
     #[inline]
     fn from_u64(v: u64) -> Self {
         SpookyValue::Number(SpookyNumber::U64(v))
     }
-    
+
     #[inline]
     fn from_f64(v: f64) -> Self {
         SpookyValue::Number(SpookyNumber::F64(v))
     }
-    
+
     #[inline]
     fn from_str(s: &str) -> Self {
         SpookyValue::Str(SmolStr::from(s))
     }
-    
+
     #[inline]
     fn from_cbor_bytes(data: &[u8]) -> Option<Self> {
         let cbor_val: cbor4ii::core::Value = cbor4ii::serde::from_slice(data).ok()?;
@@ -79,34 +79,34 @@ impl RecordDeserialize for serde_json::Value {
     fn from_null() -> Self {
         serde_json::Value::Null
     }
-    
+
     #[inline]
     fn from_bool(b: bool) -> Self {
         serde_json::Value::Bool(b)
     }
-    
+
     #[inline]
     fn from_i64(v: i64) -> Self {
         serde_json::Value::Number(v.into())
     }
-    
+
     #[inline]
     fn from_u64(v: u64) -> Self {
         serde_json::Value::Number(v.into())
     }
-    
+
     #[inline]
     fn from_f64(v: f64) -> Self {
         serde_json::Number::from_f64(v)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null)
     }
-    
+
     #[inline]
     fn from_str(s: &str) -> Self {
         serde_json::Value::String(s.to_string())
     }
-    
+
     #[inline]
     fn from_cbor_bytes(data: &[u8]) -> Option<Self> {
         cbor4ii::serde::from_slice(data).ok()
@@ -120,32 +120,32 @@ impl RecordDeserialize for cbor4ii::core::Value {
     fn from_null() -> Self {
         cbor4ii::core::Value::Null
     }
-    
+
     #[inline]
     fn from_bool(b: bool) -> Self {
         cbor4ii::core::Value::Bool(b)
     }
-    
+
     #[inline]
     fn from_i64(v: i64) -> Self {
         cbor4ii::core::Value::Integer(v as i128)
     }
-    
+
     #[inline]
     fn from_u64(v: u64) -> Self {
         cbor4ii::core::Value::Integer(v as i128)
     }
-    
+
     #[inline]
     fn from_f64(v: f64) -> Self {
         cbor4ii::core::Value::Float(v)
     }
-    
+
     #[inline]
     fn from_str(s: &str) -> Self {
         cbor4ii::core::Value::Text(s.to_string())
     }
-    
+
     #[inline]
     fn from_cbor_bytes(data: &[u8]) -> Option<Self> {
         cbor4ii::serde::from_slice(data).ok()

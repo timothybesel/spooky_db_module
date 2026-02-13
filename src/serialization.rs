@@ -9,29 +9,29 @@ use xxhash_rust::const_xxh64::xxh64;
 // ─── RecordSerialize Trait ──────────────────────────────────────────────────
 
 /// Trait for value types that can be serialized into the binary record format.
-/// 
+///
 /// This trait abstracts over different value representations (SpookyValue,
 /// serde_json::Value, cbor4ii::core::Value) allowing them to be stored in the
 /// same hybrid binary format.
 pub trait RecordSerialize: serde::Serialize {
     /// Check if this value is null.
     fn is_null(&self) -> bool;
-    
+
     /// Extract a boolean value, if this is a boolean.
     fn as_bool(&self) -> Option<bool>;
-    
+
     /// Extract an i64 value, if this is an i64.
     fn as_i64(&self) -> Option<i64>;
-    
+
     /// Extract a u64 value, if this is a u64.
     fn as_u64(&self) -> Option<u64>;
-    
+
     /// Extract an f64 value, if this is an f64.
     fn as_f64(&self) -> Option<f64>;
-    
+
     /// Extract a string slice, if this is a string.
     fn as_str(&self) -> Option<&str>;
-    
+
     /// Check if this value is nested (array or object).
     fn is_nested(&self) -> bool;
 }
@@ -43,7 +43,7 @@ impl RecordSerialize for SpookyValue {
     fn is_null(&self) -> bool {
         matches!(self, SpookyValue::Null)
     }
-    
+
     #[inline]
     fn as_bool(&self) -> Option<bool> {
         match self {
@@ -51,7 +51,7 @@ impl RecordSerialize for SpookyValue {
             _ => None,
         }
     }
-    
+
     #[inline]
     fn as_i64(&self) -> Option<i64> {
         match self {
@@ -59,7 +59,7 @@ impl RecordSerialize for SpookyValue {
             _ => None,
         }
     }
-    
+
     #[inline]
     fn as_u64(&self) -> Option<u64> {
         match self {
@@ -67,7 +67,7 @@ impl RecordSerialize for SpookyValue {
             _ => None,
         }
     }
-    
+
     #[inline]
     fn as_f64(&self) -> Option<f64> {
         match self {
@@ -75,7 +75,7 @@ impl RecordSerialize for SpookyValue {
             _ => None,
         }
     }
-    
+
     #[inline]
     fn as_str(&self) -> Option<&str> {
         match self {
@@ -83,7 +83,7 @@ impl RecordSerialize for SpookyValue {
             _ => None,
         }
     }
-    
+
     #[inline]
     fn is_nested(&self) -> bool {
         matches!(self, SpookyValue::Array(_) | SpookyValue::Object(_))
@@ -97,35 +97,38 @@ impl RecordSerialize for serde_json::Value {
     fn is_null(&self) -> bool {
         matches!(self, serde_json::Value::Null)
     }
-    
+
     #[inline]
     fn as_bool(&self) -> Option<bool> {
         self.as_bool()
     }
-    
+
     #[inline]
     fn as_i64(&self) -> Option<i64> {
         self.as_i64()
     }
-    
+
     #[inline]
     fn as_u64(&self) -> Option<u64> {
         self.as_u64()
     }
-    
+
     #[inline]
     fn as_f64(&self) -> Option<f64> {
         self.as_f64()
     }
-    
+
     #[inline]
     fn as_str(&self) -> Option<&str> {
         self.as_str()
     }
-    
+
     #[inline]
     fn is_nested(&self) -> bool {
-        matches!(self, serde_json::Value::Array(_) | serde_json::Value::Object(_))
+        matches!(
+            self,
+            serde_json::Value::Array(_) | serde_json::Value::Object(_)
+        )
     }
 }
 
@@ -136,7 +139,7 @@ impl RecordSerialize for cbor4ii::core::Value {
     fn is_null(&self) -> bool {
         matches!(self, cbor4ii::core::Value::Null)
     }
-    
+
     #[inline]
     fn as_bool(&self) -> Option<bool> {
         match self {
@@ -144,7 +147,7 @@ impl RecordSerialize for cbor4ii::core::Value {
             _ => None,
         }
     }
-    
+
     #[inline]
     fn as_i64(&self) -> Option<i64> {
         match self {
@@ -152,7 +155,7 @@ impl RecordSerialize for cbor4ii::core::Value {
             _ => None,
         }
     }
-    
+
     #[inline]
     fn as_u64(&self) -> Option<u64> {
         match self {
@@ -160,7 +163,7 @@ impl RecordSerialize for cbor4ii::core::Value {
             _ => None,
         }
     }
-    
+
     #[inline]
     fn as_f64(&self) -> Option<f64> {
         match self {
@@ -169,7 +172,7 @@ impl RecordSerialize for cbor4ii::core::Value {
             _ => None,
         }
     }
-    
+
     #[inline]
     fn as_str(&self) -> Option<&str> {
         match self {
@@ -177,10 +180,13 @@ impl RecordSerialize for cbor4ii::core::Value {
             _ => None,
         }
     }
-    
+
     #[inline]
     fn is_nested(&self) -> bool {
-        matches!(self, cbor4ii::core::Value::Array(_) | cbor4ii::core::Value::Map(_))
+        matches!(
+            self,
+            cbor4ii::core::Value::Array(_) | cbor4ii::core::Value::Map(_)
+        )
     }
 }
 
@@ -192,32 +198,32 @@ impl<T: RecordSerialize> RecordSerialize for &T {
     fn is_null(&self) -> bool {
         (**self).is_null()
     }
-    
+
     #[inline]
     fn as_bool(&self) -> Option<bool> {
         (**self).as_bool()
     }
-    
+
     #[inline]
     fn as_i64(&self) -> Option<i64> {
         (**self).as_i64()
     }
-    
+
     #[inline]
     fn as_u64(&self) -> Option<u64> {
         (**self).as_u64()
     }
-    
+
     #[inline]
     fn as_f64(&self) -> Option<f64> {
         (**self).as_f64()
     }
-    
+
     #[inline]
     fn as_str(&self) -> Option<&str> {
         (**self).as_str()
     }
-    
+
     #[inline]
     fn is_nested(&self) -> bool {
         (**self).is_nested()
@@ -234,7 +240,10 @@ impl<T: RecordSerialize> RecordSerialize for &T {
 
 /// Serialize a single field value into (bytes, type_tag).
 #[inline]
-pub fn write_field_into<V: RecordSerialize>(buf: &mut Vec<u8>, value: &V) -> Result<u8, RecordError> {
+pub fn write_field_into<V: RecordSerialize>(
+    buf: &mut Vec<u8>,
+    value: &V,
+) -> Result<u8, RecordError> {
     Ok(if value.is_null() {
         TAG_NULL
     } else if let Some(b) = value.as_bool() {
@@ -335,7 +344,9 @@ pub fn prepare_buf<V: RecordSerialize>(
 // Serializations patterns
 // ════════════════════════════════════════════════════════════════════════
 
-pub fn serialize<V: RecordSerialize>(map: &BTreeMap<SmolStr, V>) -> Result<(Vec<u8>, usize), RecordError> {
+pub fn serialize<V: RecordSerialize>(
+    map: &BTreeMap<SmolStr, V>,
+) -> Result<(Vec<u8>, usize), RecordError> {
     let field_count = map.len();
 
     // NOTE: All arithmetic must use usize
@@ -409,7 +420,7 @@ pub fn from_bytes(buf: &[u8]) -> Result<(&[u8], usize), RecordError> {
     Ok((buf, field_count))
 }
 
-// Serialize a SpookyValue::Object into a reusable buffer.
+/// Serialize a SpookyValue::Object into a reusable buffer.
 ///
 /// Identical to `serialize`, but reuses the caller's Vec to eliminate
 /// allocations when serializing many records in sequence (sync ingestion,

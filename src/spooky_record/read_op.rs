@@ -169,7 +169,6 @@ pub trait SpookyReadable {
         })
     }
 
-    ///TODO: make it generic
     /// Get any field as a value (deserializes nested CBOR if needed).
     /// Specify the value type using turbofish syntax: `get_field::<SpookyValue>("name")`.
     #[inline]
