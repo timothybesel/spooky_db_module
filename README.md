@@ -6,23 +6,25 @@ A high-performance, zero-copy binary record format for Rust. SpookyDB serializes
 
 ## Architecture
 
+SpookyDB uses a **hybrid binary format** that combines native encoding for flat fields with CBOR for nested data. It abstracts over value types using the `RecordSerialize` and `RecordDeserialize` traits, allowing seamless interoperability between `SpookyValue`, `serde_json::Value`, and `cbor4ii::core::Value`.
+
 ```
-┌──────────────────────────────────────────────────────┐
-│  SpookyValue (in-memory)                             │
-│  ├── Null, Bool, Number(i64/u64/f64), Str            │
-│  ├── Array(Vec<SpookyValue>)                         │
-│  └── Object(BTreeMap<SmolStr, SpookyValue>)           │
-└──────────────┬───────────────────┬───────────────────┘
-               │                   │
-     SpookyRecord::serialize   SpookyRecordMut::from_spooky_value
-               │                   │
-               ▼                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Generic Values (RecordSerialize / RecordDeserialize)       │
+│  ├── SpookyValue                                            │
+│  ├── serde_json::Value                                      │
+│  └── cbor4ii::core::Value                                   │
+└──────────────┬───────────────────────────┬──────────────────┘
+               │                           │
+     serialization::serialize    deserialization::decode_field
+               │                           │
+               ▼                           ▼
 ┌──────────────────────┐  ┌────────────────────────────┐
 │  SpookyRecord<'a>    │  │  SpookyRecordMut            │
 │  (immutable, &[u8])  │  │  (mutable, Vec<u8>)         │
 │  • zero-copy reads   │  │  • in-place updates         │
 │  • no allocations    │  │  • add/remove fields        │
-│  • Copy trait        │  │  • owns its buffer          │
+│  • Copy trait        │  │  • generic setters          │
 └──────────────────────┘  └────────────────────────────┘
 ```
 
@@ -50,25 +52,29 @@ A high-performance, zero-copy binary record format for Rust. SpookyDB serializes
 
 ```rust
 use spooky_db_module::spooky_value::SpookyValue;
+use spooky_db_module::serialization::{serialize, from_cbor};
 use spooky_db_module::spooky_record::SpookyRecord;
 use spooky_db_module::spooky_record_mut::SpookyRecordMut;
+use serde_json::json;
 
-// From a SpookyValue
-let data = SpookyValue::Object(/* ... */);
-let bytes = SpookyRecord::serialize(&data).unwrap();
+// 1. Serialize from SpookyValue
+let data = SpookyValue::from(json!({"name": "Alice", "age": 30}));
+let (bytes, count) = serialize(&data.as_map().unwrap()).unwrap();
 
-// Immutable zero-copy access
-let record = SpookyRecord::from_bytes(&bytes).unwrap();
-let name = record.get_str("name");       // Option<&str> — zero-copy
-let age  = record.get_i64("age");        // Option<i64>
-let ok   = record.get_bool("active");    // Option<bool>
+// 2. Immutable zero-copy access
+let record = SpookyRecord::new(&bytes, count);
+let name = record.get_str("name");                // Option<&str> — zero-copy
+let age  = record.get_i64("age");                 // Option<i64>
+let val: SpookyValue = record.get_field("age").unwrap(); // Generic get
 
-// Mutable in-place access  
-let mut rec = SpookyRecordMut::from_vec(bytes).unwrap();
-rec.set_i64("age", 29).unwrap();                       // ~6 ns
-rec.set_str("name", "Bobby").unwrap();                  // ~13 ns (same len)
-rec.add_field("new", &SpookyValue::from(true)).unwrap();// ~191 ns
-rec.remove_field("old").unwrap();                       // ~146 ns
+// 3. Mutable in-place access
+let mut rec = SpookyRecordMut::new(bytes, count);
+rec.set_i64("age", 29).unwrap();                  // ~6 ns
+rec.set_str("name", "Bobby").unwrap();            // ~13 ns (same len)
+
+// 4. Generic Setters (works with any RecordSerialize type)
+rec.add_field("active", &true).unwrap();          // generic boolean
+rec.set_field("meta", &json!({"foo": "bar"})).unwrap(); // generic JSON
 ```
 
 ### FieldSlot Cached Access (O(1))
@@ -78,19 +84,12 @@ For hot paths where the same fields are read/written repeatedly (e.g. DBSP chang
 ```rust
 // Resolve once — O(log n) binary search
 let age_slot = rec.resolve("age").unwrap();
-let name_slot = rec.resolve("name").unwrap();
 
 // Read via slot — O(1), no hashing, no search (~1 ns)
 let age = rec.get_i64_at(&age_slot);       // Some(29)
-let name = rec.get_str_at(&name_slot);     // Some("Bobby")
 
 // Write via slot — O(1), in-place (~0.6 ns)
 rec.set_i64_at(&age_slot, 30).unwrap();
-
-// Slots auto-invalidate on layout changes (debug assertion)
-rec.add_field("x", &SpookyValue::from(1i64)).unwrap();  // bumps generation
-// age_slot is now stale — re-resolve needed
-let age_slot = rec.resolve("age").unwrap();
 ```
 
 ### Buffer Reuse for Bulk Serialization
@@ -98,19 +97,13 @@ let age_slot = rec.resolve("age").unwrap();
 Eliminate per-record heap allocations when serializing many records (**~17% faster**):
 
 ```rust
+use spooky_db_module::serialization::serialize_into;
+
 // Serialize thousands of records with one allocation
 let mut buf = Vec::new();
 for record in incoming_stream {
-    SpookyRecord::serialize_into(&record, &mut buf)?;
+    serialize_into(&record, &mut buf)?;
     store.put(key, &buf);  // buf reused on next iteration
-}
-
-// Build many mutable records from reused buffer
-let mut buf = Vec::with_capacity(1024);
-for data in batch {
-    let rec = SpookyRecordMut::from_spooky_value_into(&data, buf)?;
-    process(&rec);
-    buf = rec.into_bytes();  // reclaim buffer
 }
 ```
 
@@ -118,17 +111,13 @@ for data in batch {
 
 | Method | Returns | Description |
 |---|---|---|
-| `serialize(&SpookyValue)` | `Result<Vec<u8>>` | Serialize object to binary |
-| `serialize_into(&SpookyValue, &mut Vec)` | `Result<()>` | Serialize into reusable buffer |
-| `from_bytes(&[u8])` | `Result<Self>` | Zero-copy wrap byte slice |
 | `get_str(name)` | `Option<&str>` | Zero-copy string access |
 | `get_i64(name)` | `Option<i64>` | Read i64 field |
 | `get_u64(name)` | `Option<u64>` | Read u64 field |
 | `get_f64(name)` | `Option<f64>` | Read f64 field |
 | `get_bool(name)` | `Option<bool>` | Read bool field |
-| `get_field(name)` | `Option<SpookyValue>` | Deserialize any field |
+| `get_field<V>(name)` | `Option<V>` | **Generic**: Deserialize any field to `V` |
 | `get_raw(name)` | `Option<FieldRef>` | Raw field reference |
-| `field_type(name)` | `Option<u8>` | Type tag without decoding |
 | `get_number_as_f64(name)` | `Option<f64>` | Any numeric → f64 |
 | `has_field(name)` | `bool` | Existence check |
 | `iter_fields()` | `FieldIter` | Iterate raw fields |
@@ -138,10 +127,8 @@ for data in batch {
 
 | Method | Description |
 |---|---|
-| `from_spooky_value(&SpookyValue)` | Create from value |
-| `from_spooky_value_into(&SpookyValue, Vec)` | Create from value, reuse buffer |
-| `from_vec(Vec<u8>)` | Take ownership of buffer |
-| `new_empty()` | Empty record |
+| `new(Vec<u8>, usize)` | Create from existing buffer |
+| `new_empty()` | Create empty record |
 | **By-name access** | |
 | `set_i64(name, val)` | In-place i64 overwrite |
 | `set_u64(name, val)` | In-place u64 overwrite |
@@ -149,39 +136,22 @@ for data in batch {
 | `set_bool(name, val)` | In-place bool overwrite |
 | `set_str(name, val)` | String set (splice if needed) |
 | `set_str_exact(name, val)` | Same-length string only |
-| `set_field(name, &SpookyValue)` | Generic setter |
+| `set_field<V>(name, &V)` | **Generic**: Set any `RecordSerialize` value |
 | `set_null(name)` | Set field to null |
-| `add_field(name, &SpookyValue)` | Add new field |
+| `add_field<V>(name, &V)` | **Generic**: Add new field |
 | `remove_field(name)` | Remove field |
 | **FieldSlot cached access** | |
-| `resolve(name)` | Resolve field → `FieldSlot` (one-time O(log n)) |
-| `get_i64_at(&slot)` | O(1) cached i64 read |
-| `get_u64_at(&slot)` | O(1) cached u64 read |
-| `get_f64_at(&slot)` | O(1) cached f64 read |
-| `get_bool_at(&slot)` | O(1) cached bool read |
-| `get_str_at(&slot)` | O(1) cached string read |
-| `set_i64_at(&slot, val)` | O(1) cached i64 write |
-| `set_u64_at(&slot, val)` | O(1) cached u64 write |
-| `set_f64_at(&slot, val)` | O(1) cached f64 write |
-| `set_bool_at(&slot, val)` | O(1) cached bool write |
-| `set_str_at(&slot, val)` | O(1) same-length string write |
-| **Other** | |
-| `as_record()` | Borrow as `SpookyRecord` |
+| `resolve(name)` | Resolve field → `FieldSlot` |
+| `get_*_at(&slot)` | O(1) cached read |
+| `set_*_at(&slot, val)` | O(1) cached write |
 
-### SpookyValue
+### Supported Types
 
-Dynamically-typed value enum with full `Eq`/`Ord`/`Hash` support:
+The module supports generic serialization via `RecordSerialize` and `RecordDeserialize`:
 
-```rust
-pub enum SpookyValue {
-    Null,
-    Bool(bool),
-    Number(SpookyNumber),  // I64 | U64 | F64
-    Str(SmolStr),
-    Array(Vec<SpookyValue>),
-    Object(BTreeMap<SmolStr, SpookyValue>),
-}
-```
+- `SpookyValue`: Dynamic value enum (Null, Bool, Number, Str, Array, Object)
+- `serde_json::Value`: Standard JSON types
+- `cbor4ii::core::Value`: Low-level CBOR types
 
 ## Benchmarks
 
@@ -332,7 +302,7 @@ open target/criterion/report/index.html
 
 | Crate | Purpose |
 |---|---|
-| `ciborium` | CBOR encoding for nested objects/arrays |
+| `cbor4ii` | Fast, zero-copy CBOR encoding/decoding |
 | `xxhash-rust` | Fast 64-bit hashing for field name lookups |
 | `smol_str` | Small-string-optimized string type |
 | `serde` | Serialization framework |
