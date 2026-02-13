@@ -84,14 +84,14 @@ impl SpookyRecordMut {
     ///
     /// This avoids the duplicated rebuild logic between add_field and
     /// remove_field (and any future structural mutations).
-    fn rebuild_buffer_with<F>(
+    fn rebuild_buffer_with<'a, F>(
         &self,
         old_n: usize,
         new_n: usize,
         field_source: F,
     ) -> Result<Vec<u8>, RecordError>
     where
-        F: Fn(usize) -> FieldSource<'_>,
+        F: Fn(usize) -> FieldSource<'a>,
     {
         // Pre-read all existing field metadata in one pass
         let old_entries = self.read_all_index_entries(old_n)?;
@@ -111,7 +111,7 @@ impl SpookyRecordMut {
         let mut data_cursor = new_data_start;
 
         for dst_i in 0..new_n {
-            let (hash, data_len, tag) = match field_source(dst_i) {
+            let (hash, len, tag) = match field_source(dst_i) {
                 FieldSource::New { hash, data, tag } => {
                     buf[data_cursor..data_cursor + data.len()].copy_from_slice(data);
                     (hash, data.len(), tag)
@@ -132,10 +132,10 @@ impl SpookyRecordMut {
             let entry = &mut buf[idx..idx + INDEX_ENTRY_SIZE];
             entry[0..8].copy_from_slice(&hash.to_le_bytes());
             entry[8..12].copy_from_slice(&(data_cursor as u32).to_le_bytes());
-            entry[12..16].copy_from_slice(&(data_len as u32).to_le_bytes());
+            entry[12..16].copy_from_slice(&(len as u32).to_le_bytes());
             entry[16] = tag;
 
-            data_cursor += data_len;
+            data_cursor += len;
         }
 
         Ok(buf)
@@ -143,7 +143,7 @@ impl SpookyRecordMut {
 
     /// Read all index entries in one pass, avoiding repeated bounds checks.
     #[inline]
-    fn read_all_index_entries(&self, n: usize) -> Result<Vec<IndexMeta>, RecordError> {
+    fn read_all_index_entries(&self, n: usize) -> Result<Vec<IndexEntry>, RecordError> {
         let mut entries = Vec::with_capacity(n);
         for i in 0..n {
             entries.push(self.read_index(i).ok_or(RecordError::InvalidBuffer)?);
