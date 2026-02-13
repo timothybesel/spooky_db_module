@@ -67,7 +67,7 @@ pub struct FieldSlot {
 ///
 pub struct SpookyRecordMut {
     buf: Vec<u8>,
-    field_count: u32,
+    field_count: usize,
     /// Generation counter, bumped on every layout-changing mutation.
     /// Used to detect stale FieldSlots.
     generation: u32,
