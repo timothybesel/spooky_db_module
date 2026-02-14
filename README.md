@@ -9,23 +9,25 @@ A high-performance, zero-copy binary record format for Rust. SpookyDB serializes
 SpookyDB uses a **hybrid binary format** that combines native encoding for flat fields with CBOR for nested data. It abstracts over value types using the `RecordSerialize` and `RecordDeserialize` traits, allowing seamless interoperability between `SpookyValue`, `serde_json::Value`, and `cbor4ii::core::Value`.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Generic Values (RecordSerialize / RecordDeserialize)       │
-│  ├── SpookyValue                                            │
-│  ├── serde_json::Value                                      │
-│  └── cbor4ii::core::Value                                   │
-└──────────────┬───────────────────────────┬──────────────────┘
-               │                           │
-     serialization::serialize    deserialization::decode_field
-               │                           │
-               ▼                           ▼
-┌──────────────────────┐  ┌────────────────────────────┐
-│  SpookyRecord<'a>    │  │  SpookyRecordMut            │
-│  (immutable, &[u8])  │  │  (mutable, Vec<u8>)         │
-│  • zero-copy reads   │  │  • in-place updates         │
-│  • no allocations    │  │  • add/remove fields        │
-│  • Copy trait        │  │  • generic setters          │
-└──────────────────────┘  └────────────────────────────┘
+   ┌─────────────────────────────────────────────────────────────┐
+   │  Generic Values (RecordSerialize / RecordDeserialize)       │
+   │  ├── SpookyValue                                            │
+   │  ├── serde_json::Value                                      │
+   │  └── cbor4ii::core::Value                                   │
+   └──────────────┬──────────────────────────────────────────────┘
+                  │                              ▲
+        serialization::serialize                 │
+                  │                  deserialization::decode_field
+                  ▼                              │
+┌────────────────────────────────────────────────┴───────────────────┐
+│   ┌────────────────────────────┐  ┌────────────────────────────┐   │  
+│   │     SpookyRecord<'a>       │  │     SpookyRecordMut        │   │
+│   │     (immutable, &[u8])     │  │     (mutable, Vec<u8>)     │   │
+│   │     • zero-copy reads      │  │     • in-place updates     │   │
+│   │     • no allocations       │  │     • add/remove fields    │   │
+│   │     • Copy trait           │  │     • generic setters      │   │
+│   └────────────────────────────┘  └────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Binary Format
@@ -33,13 +35,13 @@ SpookyDB uses a **hybrid binary format** that combines native encoding for flat 
 ```
 ┌────────────────────── Header (20 bytes) ──────────────────┐
 │  field_count: u32 (LE)  |  reserved: [u8; 16]             │
-├────────────────── Index (20 bytes × N) ──────────────────┤
-│  name_hash:   u64 (LE)   ← SORTED for binary search      │
+├────────────────── Index (20 bytes × N) ───────────────────┤
+│  name_hash:   u64 (LE)   ← SORTED for binary search       │
 │  data_offset: u32 (LE)                                    │
 │  data_length: u32 (LE)                                    │
 │  type_tag:    u8                                          │
 │  _padding:    [u8; 3]                                     │
-├──────────────────── Field Data ──────────────────────────┤
+├──────────────────── Field Data ───────────────────────────┤
 │  Flat types: native LE bytes (i64, u64, f64, bool)        │
 │  Strings: raw UTF-8 bytes                                 │
 │  Nested objects/arrays: CBOR-encoded                      │
@@ -267,16 +269,16 @@ A `generation` counter on `SpookyRecordMut` tracks layout changes. Fixed-width w
 
 ```
   ┌──────────────────────────────────────────────────────────────────────┐
-  │ Operation              │ Speed              │ Category              │
-  ├────────────────────────┼────────────────────┼───────────────────────┤
-  │ FieldSlot reads        │ ~670M-1.06B ops/s  │ O(1) cached, 0 allocs │
-  │ FieldSlot writes       │ ~228M-1.56B ops/s  │ O(1) cached, 0 allocs │
-  │ Typed reads (by name)  │ ~86-111M ops/s     │ O(log n), 0 allocs    │
-  │ In-place sets          │ ~118-155M ops/s    │ Zero-alloc overwrites │
-  │ String splice          │ ~36-85M ops/s      │ Buffer resize         │
-  │ Add/Remove field       │ ~5-7M ops/s        │ Full rebuild          │
-  │ Serialize (reuse buf)  │ ~2.3M recs/s       │ Buffer reuse          │
-  │ Serialize (fresh)      │ ~1.9M recs/s       │ Allocates per record  │
+  │ Operation              │ Speed              │ Category               │
+  ├────────────────────────┼────────────────────┼────────────────────────┤
+  │ FieldSlot reads        │ ~670M-1.06B ops/s  │ O(1) cached, 0 allocs  │
+  │ FieldSlot writes       │ ~228M-1.56B ops/s  │ O(1) cached, 0 allocs  │
+  │ Typed reads (by name)  │ ~86-111M ops/s     │ O(log n), 0 allocs     │
+  │ In-place sets          │ ~118-155M ops/s    │ Zero-alloc overwrites  │
+  │ String splice          │ ~36-85M ops/s      │ Buffer resize          │
+  │ Add/Remove field       │ ~5-7M ops/s        │ Full rebuild           │
+  │ Serialize (reuse buf)  │ ~2.3M recs/s       │ Buffer reuse           │
+  │ Serialize (fresh)      │ ~1.9M recs/s       │ Allocates per record   │
   └──────────────────────────────────────────────────────────────────────┘
 ```
 
