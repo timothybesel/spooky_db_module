@@ -17,7 +17,7 @@ pub const TAG_U64: u8 = 6; // Extension
 //  │   _reserved: [u8; 16]                        │
 //  ├──────────────────────────────────────────────┤
 //  │ Index (20 bytes × field_count)               │
-//  │   name_hash:   u64 (LE)    ← SORTED by hash │
+//  │   name_hash:   u64 (LE)    ← SORTED by hash  │
 //  │   data_offset: u32 (LE)                      │
 //  │   data_length: u32 (LE)                      │
 //  │   type_tag:    u8                            │

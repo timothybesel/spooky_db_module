@@ -1,6 +1,7 @@
 #[path = "data/cbor_flat_map.rs"]
 pub mod cbor_flat_map;
 use criterion::{Criterion, criterion_group, criterion_main};
+use spooky_db_module::deserialization::RecordDeserialize;
 use spooky_db_module::serialization::{from_bytes, from_cbor, from_spooky, serialize_into};
 use spooky_db_module::spooky_record::record_mut::SpookyRecordMut;
 use spooky_db_module::spooky_record::{SpookyReadable, SpookyRecord};
@@ -92,6 +93,13 @@ fn bench_creating_spooky_record(c: &mut Criterion) {
 
     // 1a. Full pipeline: CBOR → SpookyValue → from_spooky
     group.bench_function("from_spooky", |b| {
+        b.iter(|| {
+            let spooky_val = SpookyValue::from_cbor_bytes(BENCH_CBOR).unwrap();
+            from_spooky(black_box(&spooky_val)).unwrap()
+        })
+    });
+
+    group.bench_function("from_cbor", |b| {
         b.iter(|| {
             let cbor_val: cbor4ii::core::Value =
                 cbor4ii::serde::from_slice(black_box(BENCH_CBOR)).unwrap();
