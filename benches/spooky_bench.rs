@@ -1,11 +1,13 @@
 #[path = "data/cbor_flat_map.rs"]
 pub mod cbor_flat_map;
 use criterion::{Criterion, criterion_group, criterion_main};
+use spooky_db_module::db::{BulkRecord, DbMutation, Operation, SpookyDb};
 use spooky_db_module::deserialization::RecordDeserialize;
 use spooky_db_module::serialization::{from_bytes, from_cbor, from_spooky, serialize_into};
 use spooky_db_module::spooky_record::record_mut::SpookyRecordMut;
 use spooky_db_module::spooky_record::{SpookyReadable, SpookyRecord};
 use spooky_db_module::spooky_value::SpookyValue;
+use smol_str::SmolStr;
 use std::hint::black_box;
 
 // ─── Test Data ──────────────────────────────────────────────────────────────
@@ -409,6 +411,195 @@ fn bench_buffer_reuse(c: &mut Criterion) {
     group.finish();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Persistence Layer Benchmarks
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Baseline (2026-02-21, Apple M-series, smoke-test only — full timing pending
+// approval to run cargo bench without --test):
+// apply_batch/1      — (see below after first full bench run)
+// apply_batch/10     — (see below)
+// apply_batch/100    — (see below)
+// apply_batch/1000   — (see below)
+// get_record_bytes   — (in-memory lookup, zero I/O; serves as post-Phase-2 baseline)
+// rebuild_zsets      — (startup scan cost for 10k records)
+// bulk_load/100      — (see below)
+// bulk_load/1000     — (see below)
+// bulk_load/10000    — (see below)
+
+/// Build a pre-serialized record payload once (reused across bench setups).
+fn make_record_bytes() -> Vec<u8> {
+    let cbor_val: cbor4ii::core::Value =
+        cbor4ii::serde::from_slice(BENCH_CBOR).unwrap();
+    let (buf, _) = from_cbor(&cbor_val).unwrap();
+    buf
+}
+
+/// Open a fresh SpookyDb in a temp directory and return (db, tempdir).
+/// The tempdir must be kept alive for the duration of the bench group.
+fn open_fresh_db() -> (SpookyDb, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bench.redb");
+    let db = SpookyDb::new(&path).unwrap();
+    (db, dir)
+}
+
+/// Populate a SpookyDb with `n` records in a single bulk_load call.
+/// Returns (db, tempdir).
+fn populated_db(n: usize) -> (SpookyDb, tempfile::TempDir) {
+    let data = make_record_bytes();
+    let (mut db, dir) = open_fresh_db();
+    let records: Vec<BulkRecord> = (0..n)
+        .map(|i| BulkRecord {
+            table: SmolStr::new("bench_table"),
+            id: SmolStr::new(format!("id_{i}")),
+            data: data.clone(),
+            version: None,
+        })
+        .collect();
+    db.bulk_load(records).unwrap();
+    (db, dir)
+}
+
+// ─── Group: apply_batch ───────────────────────────────────────────────────
+//
+// Benchmarks a batch of 1, 10, 100, and 1000 Create mutations in a single
+// redb write transaction. Setup (db creation + serialization) is outside
+// the timed loop via iter_batched.
+
+fn bench_apply_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("apply_batch");
+    let data = make_record_bytes();
+
+    for &batch_size in &[1usize, 10, 100, 1000] {
+        group.bench_function(format!("{}", batch_size), |b| {
+            b.iter_batched(
+                || {
+                    // Setup: fresh db + pre-built mutations (serialization outside loop).
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("bench.redb");
+                    let db = SpookyDb::new(&path).unwrap();
+                    let mutations: Vec<DbMutation> = (0..batch_size)
+                        .map(|i| DbMutation {
+                            table: SmolStr::new("bench_table"),
+                            id: SmolStr::new(format!("id_{i}")),
+                            op: Operation::Create,
+                            data: Some(data.clone()),
+                            version: Some(i as u64),
+                        })
+                        .collect();
+                    (db, mutations, dir)
+                },
+                |(mut db, mutations, _dir)| {
+                    black_box(db.apply_batch(black_box(mutations)).unwrap());
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+
+    group.finish();
+}
+
+// ─── Group: get_record_bytes ──────────────────────────────────────────────
+//
+// After bulk-loading 1000 records, benchmark 1000 sequential
+// get_record_bytes calls. Served entirely from the in-memory row cache
+// (Phase 2 behaviour — zero redb I/O per call).
+
+fn bench_get_record_bytes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("get_record_bytes");
+    group.sample_size(200);
+
+    let (db, _dir) = populated_db(1000);
+    let ids: Vec<SmolStr> = (0..1000).map(|i| SmolStr::new(format!("id_{i}"))).collect();
+
+    group.bench_function("1000_sequential", |b| {
+        b.iter(|| {
+            for id in &ids {
+                black_box(db.get_record_bytes(black_box("bench_table"), black_box(id.as_str())));
+            }
+        })
+    });
+
+    group.finish();
+}
+
+// ─── Group: rebuild_zsets ─────────────────────────────────────────────────
+//
+// Benchmarks SpookyDb::new (open) on a db with 10k pre-loaded records.
+// This measures the startup sequential scan cost (rebuild_from_records).
+
+fn bench_rebuild_zsets(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rebuild_zsets");
+    // Fewer samples — each iteration involves a full redb scan.
+    group.sample_size(20);
+
+    // Pre-populate a db with 10k records. Keep the tempdir alive.
+    let data = make_record_bytes();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bench_10k.redb");
+    {
+        let mut db = SpookyDb::new(&db_path).unwrap();
+        let records: Vec<BulkRecord> = (0..10_000)
+            .map(|i| BulkRecord {
+                table: SmolStr::new("bench_table"),
+                id: SmolStr::new(format!("id_{i}")),
+                data: data.clone(),
+                version: None,
+            })
+            .collect();
+        db.bulk_load(records).unwrap();
+    }
+
+    group.bench_function("10k_records_open", |b| {
+        b.iter(|| {
+            // Re-open the same db; this triggers the full startup scan.
+            black_box(SpookyDb::new(black_box(&db_path)).unwrap());
+        })
+    });
+
+    group.finish();
+}
+
+// ─── Group: bulk_load ────────────────────────────────────────────────────
+//
+// Benchmarks bulk_load of 100, 1000, and 10000 BulkRecord entries.
+// All records go into one redb write transaction (one fsync).
+
+fn bench_bulk_load(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bulk_load");
+    group.sample_size(20);
+    let data = make_record_bytes();
+
+    for &n in &[100usize, 1000, 10_000] {
+        group.bench_function(format!("{}", n), |b| {
+            b.iter_batched(
+                || {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("bench.redb");
+                    let db = SpookyDb::new(&path).unwrap();
+                    let records: Vec<BulkRecord> = (0..n)
+                        .map(|i| BulkRecord {
+                            table: SmolStr::new("bench_table"),
+                            id: SmolStr::new(format!("id_{i}")),
+                            data: data.clone(),
+                            version: None,
+                        })
+                        .collect();
+                    (db, records, dir)
+                },
+                |(mut db, records, _dir)| {
+                    black_box(db.bulk_load(black_box(records)).unwrap());
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
+    }
+
+    group.finish();
+}
+
 // ─── Criterion Main ─────────────────────────────────────────────────────────
 
 criterion_group!(
@@ -419,5 +610,9 @@ criterion_group!(
     bench_field_migration,
     bench_fieldslot,
     bench_buffer_reuse,
+    bench_apply_batch,
+    bench_get_record_bytes,
+    bench_rebuild_zsets,
+    bench_bulk_load,
 );
 criterion_main!(benches);

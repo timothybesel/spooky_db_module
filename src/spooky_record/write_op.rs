@@ -38,7 +38,7 @@ impl SpookyRecordMut {
     /// whose data starts STRICTLY AFTER `splice_offset` by `delta` bytes.
     /// The field at `skip_pos` (the one we just modified) is excluded.
     fn fixup_offsets_after_splice(&mut self, skip_pos: usize, splice_offset: usize, delta: isize) {
-        for i in 0..self.field_count as usize {
+        for i in 0..self.field_count {
             if i == skip_pos {
                 continue;
             }
@@ -248,6 +248,7 @@ impl SpookyRecordMut {
     /// Set an i64 field using a cached FieldSlot. In-place, ~20ns.
     #[inline]
     pub fn set_i64_at(&mut self, slot: &FieldSlot, value: i64) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
         if slot.type_tag != TAG_I64 {
             return Err(RecordError::TypeMismatch {
                 expected: TAG_I64,
@@ -261,6 +262,7 @@ impl SpookyRecordMut {
     /// Set a u64 field using a cached FieldSlot. In-place, ~20ns.
     #[inline]
     pub fn set_u64_at(&mut self, slot: &FieldSlot, value: u64) -> Result<(), RecordError> {
+        debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
         if slot.type_tag != TAG_U64 {
             return Err(RecordError::TypeMismatch {
                 expected: TAG_U64,

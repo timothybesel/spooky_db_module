@@ -12,6 +12,15 @@ pub struct SpookyRecordMut {
 
 impl SpookyRecordMut {
     pub fn new(data_buf: Vec<u8>, field_count: usize) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            // Verify caller-provided field_count matches the header.
+            let header_count = u32::from_le_bytes(data_buf[0..4].try_into().expect("buf too short")) as usize;
+            debug_assert_eq!(
+                field_count, header_count,
+                "SpookyRecordMut::new: caller field_count {field_count} != header {header_count}"
+            );
+        }
         Self {
             data_buf,
             field_count,
@@ -37,7 +46,7 @@ impl SpookyRecordMut {
 
     /// Find the sorted insertion position for a new hash.
     pub fn find_insert_pos(&self, hash: u64) -> usize {
-        let n = self.field_count as usize;
+        let n = self.field_count;
         let mut lo = 0usize;
         let mut hi = n;
         while lo < hi {

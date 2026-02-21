@@ -1,3 +1,5 @@
+use arrayvec::ArrayVec;
+
 use super::read_op::SpookyReadable;
 use super::record_mut::SpookyRecordMut;
 use crate::error::RecordError;
@@ -25,10 +27,11 @@ impl SpookyRecordMut {
         let mut new_bytes = Vec::new();
         let new_tag = write_field_into(&mut new_bytes, value)?;
         let insert_pos = self.find_insert_pos(hash);
-        let old_n = self.field_count as usize;
+        let old_n = self.field_count;
         let new_n = old_n + 1;
 
-        let new_buf = self.rebuild_buffer_with(old_n, new_n, |i| {
+        let mut scratch = Vec::new();
+        self.rebuild_buffer_with(&mut scratch, old_n, new_n, |i| {
             if i == insert_pos {
                 FieldSource::New {
                     hash,
@@ -41,7 +44,7 @@ impl SpookyRecordMut {
             }
         })?;
 
-        self.data_buf = new_buf;
+        self.data_buf = scratch;
         self.field_count = new_n;
         self.generation += 1;
         Ok(())
@@ -52,7 +55,7 @@ impl SpookyRecordMut {
     /// Rebuilds the buffer without the removed field.
     pub fn remove_field(&mut self, name: &str) -> Result<(), RecordError> {
         let (remove_pos, _) = self.find_field(name)?;
-        let old_n = self.field_count as usize;
+        let old_n = self.field_count;
         let new_n = old_n - 1;
 
         if new_n == 0 {
@@ -63,12 +66,13 @@ impl SpookyRecordMut {
             return Ok(());
         }
 
-        let new_buf = self.rebuild_buffer_with(old_n, new_n, |i| {
+        let mut scratch = Vec::new();
+        self.rebuild_buffer_with(&mut scratch, old_n, new_n, |i| {
             let src_i = if i < remove_pos { i } else { i + 1 };
             FieldSource::Existing(src_i)
         })?;
 
-        self.data_buf = new_buf;
+        self.data_buf = scratch;
         self.field_count = new_n;
         self.generation += 1;
         Ok(())
@@ -78,17 +82,23 @@ impl SpookyRecordMut {
     // Internal: buffer rebuild helpers
     // ════════════════════════════════════════════════════════════════════════
 
-    /// Rebuild the record buffer with a mapping function that determines,
-    /// for each destination index slot, where the field data comes from.
+    /// Rebuild the record buffer into `scratch`, reusing its existing allocation.
+    ///
+    /// `scratch` is cleared and filled with the rebuilt record. On success,
+    /// callers should swap `scratch` into `self.data_buf`. Accepting a caller-
+    /// supplied scratch buffer allows callers that perform multiple structural
+    /// mutations in sequence (e.g. a migration loop) to reuse the same buffer
+    /// across iterations, saving one heap allocation per mutation.
     ///
     /// This avoids the duplicated rebuild logic between add_field and
     /// remove_field (and any future structural mutations).
     fn rebuild_buffer_with<'a, F>(
         &self,
+        scratch: &mut Vec<u8>,
         old_n: usize,
         new_n: usize,
         field_source: F,
-    ) -> Result<Vec<u8>, RecordError>
+    ) -> Result<(), RecordError>
     where
         F: Fn(usize) -> FieldSource<'a>,
     {
@@ -104,21 +114,23 @@ impl SpookyRecordMut {
             })
             .sum();
 
-        let mut buf = vec![0u8; new_data_start + total_data];
-        buf[0..4].copy_from_slice(&(new_n as u32).to_le_bytes());
+        // Reuse the existing allocation: clear and resize instead of a fresh Vec.
+        scratch.clear();
+        scratch.resize(new_data_start + total_data, 0u8);
+        scratch[0..4].copy_from_slice(&(new_n as u32).to_le_bytes());
 
         let mut data_cursor = new_data_start;
 
         for dst_i in 0..new_n {
             let (hash, len, tag) = match field_source(dst_i) {
                 FieldSource::New { hash, data, tag } => {
-                    buf[data_cursor..data_cursor + data.len()].copy_from_slice(data);
+                    scratch[data_cursor..data_cursor + data.len()].copy_from_slice(data);
                     (hash, data.len(), tag)
                 }
                 FieldSource::Existing(src_i) => {
                     let e = &old_entries[src_i];
                     if e.data_len > 0 {
-                        buf[data_cursor..data_cursor + e.data_len].copy_from_slice(
+                        scratch[data_cursor..data_cursor + e.data_len].copy_from_slice(
                             &self.data_buf[e.data_offset..e.data_offset + e.data_len],
                         );
                     }
@@ -128,7 +140,7 @@ impl SpookyRecordMut {
 
             // Write index entry — single slice bounds check, then relative writes
             let idx = HEADER_SIZE + dst_i * INDEX_ENTRY_SIZE;
-            let entry = &mut buf[idx..idx + INDEX_ENTRY_SIZE];
+            let entry = &mut scratch[idx..idx + INDEX_ENTRY_SIZE];
             entry[0..8].copy_from_slice(&hash.to_le_bytes());
             entry[8..12].copy_from_slice(&(data_cursor as u32).to_le_bytes());
             entry[12..16].copy_from_slice(&(len as u32).to_le_bytes());
@@ -137,15 +149,20 @@ impl SpookyRecordMut {
             data_cursor += len;
         }
 
-        Ok(buf)
+        Ok(())
     }
 
-    /// Read all index entries in one pass, avoiding repeated bounds checks.
+    /// Read all index entries in one pass into a stack-allocated ArrayVec.
+    ///
+    /// The 32-field hard limit (enforced by serialization) ensures the
+    /// ArrayVec capacity of 32 is never exceeded in valid records.
+    /// One `try_push` failure signals a corrupt buffer (field_count > 32).
     #[inline]
-    fn read_all_index_entries(&self, n: usize) -> Result<Vec<IndexEntry>, RecordError> {
-        let mut entries = Vec::with_capacity(n);
+    fn read_all_index_entries(&self, n: usize) -> Result<ArrayVec<IndexEntry, 32>, RecordError> {
+        let mut entries = ArrayVec::<IndexEntry, 32>::new();
         for i in 0..n {
-            entries.push(self.read_index(i).ok_or(RecordError::InvalidBuffer)?);
+            let e = self.read_index(i).ok_or(RecordError::InvalidBuffer)?;
+            entries.try_push(e).map_err(|_| RecordError::InvalidBuffer)?;
         }
         Ok(entries)
     }

@@ -1,33 +1,24 @@
 // ─── Error ──────────────────────────────────────────────────────────────────
-#[derive(Debug)]
+use thiserror::Error;
+
+#[derive(Debug, Error)]
 pub enum RecordError {
+    #[error("Can't Serialize none Object Types")]
     SerializationNotObject,
+    #[error("Invalid buffer structure")]
     InvalidBuffer,
+    #[error("record exceeds the 32-field limit")]
     TooManyFields,
+    #[error("Field not found")]
     FieldNotFound,
+    #[error("Type mismatch: expected {expected}, got {actual}")]
     TypeMismatch { expected: u8, actual: u8 },
+    #[error("Length mismatch: expected {expected}, got {actual}")]
     LengthMismatch { expected: usize, actual: usize },
+    #[error("Field already exists")]
     FieldExists,
+    #[error("CBOR error: {0}")]
     CborError(String),
+    #[error("Unknown type tag: {0}")]
+    UnknownTypeTag(u8),
 }
-
-impl std::fmt::Display for RecordError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RecordError::SerializationNotObject => write!(f, "Can't Serialize none Object Types"),
-            RecordError::InvalidBuffer => write!(f, "Invalid buffer structure"),
-            RecordError::TooManyFields => write!(f, ">= 32 Entetys"),
-            RecordError::FieldNotFound => write!(f, "Field not found"),
-            RecordError::TypeMismatch { expected, actual } => {
-                write!(f, "Type mismatch: expected {}, got {}", expected, actual)
-            }
-            RecordError::LengthMismatch { expected, actual } => {
-                write!(f, "Length mismatch: expected {}, got {}", expected, actual)
-            }
-            RecordError::FieldExists => write!(f, "Field already exists"),
-            RecordError::CborError(msg) => write!(f, "CBOR error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for RecordError {}

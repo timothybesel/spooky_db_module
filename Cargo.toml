@@ -8,6 +8,7 @@ arrayvec = "0.7.6"
 cbor4ii = { version = "1.2.2", features = ["use_alloc", "serde1", "use_std"] }
 
 redb = "3.1.0"
+thiserror = "1"
 rustc-hash = "2.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

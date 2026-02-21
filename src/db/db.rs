@@ -1,11 +1,12 @@
 use std::path::Path;
 
+use arrayvec::ArrayString;
 use redb::{Database as RedbDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 use smol_str::SmolStr;
 
 use super::types::{
-    BatchMutationResult, BulkRecord, DbMutation, FastHashSet, FastMap, Operation, SpookyDbError,
-    ZSet,
+    BatchMutationResult, BulkRecord, DbMutation, FastHashSet, FastMap, Operation, RowStore,
+    SpookyDbError, TableName, ZSet,
 };
 use crate::serialization::from_bytes;
 use crate::spooky_record::{SpookyReadable, SpookyRecord};
@@ -29,20 +30,27 @@ const VERSION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("versions
 /// Persistent record store backed by redb.
 ///
 /// **Ownership**: `SpookyDb` is meant to be owned exclusively by one component
-/// (e.g. the circuit runner). No `Arc`, no `Mutex` — callers hold `&mut self`
+/// (e.g. a streaming data processor). No `Arc`, no `Mutex` — callers hold `&mut self`
 /// for write operations.
 ///
 /// **ZSet**: a per-table in-memory `FastMap<record_id, weight>` that shadows
 /// RECORDS_TABLE. Rebuilt from a sequential RECORDS_TABLE scan on startup.
 /// All view-evaluation ZSet reads are pure memory — zero I/O.
 pub struct SpookyDb {
-    /// On-disk KV store.
+    /// On-disk KV store. Written on every mutation; read only during startup.
     db: RedbDatabase,
 
     /// Hot ZSet per table. Key: table name → Value: (record_id → weight).
     /// INVARIANT: table names must not contain ':'.
     /// Weight 1 = record present; absent = deleted.
     zsets: FastMap<SmolStr, ZSet>,
+
+    /// In-memory row cache. Key: table_name → (record_id → SpookyRecord bytes).
+    ///
+    /// Primary read source for all view evaluation. Zero I/O on reads.
+    /// Written on every Create/Update; evicted on Delete.
+    /// Rebuilt from RECORDS_TABLE on startup (same scan as `zsets`).
+    rows: FastMap<TableName, RowStore>,
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -67,24 +75,29 @@ impl SpookyDb {
         let mut spooky = SpookyDb {
             db,
             zsets: FastMap::default(),
+            rows: FastMap::default(),
         };
-        spooky.rebuild_zsets_from_records()?;
+        spooky.rebuild_from_records()?;
         Ok(spooky)
     }
 
-    /// Sequential scan of RECORDS_TABLE. Sets `zsets[table][id] = 1` for every
-    /// key found. Also populates the table registry (no TABLES_TABLE needed).
-    fn rebuild_zsets_from_records(&mut self) -> Result<(), SpookyDbError> {
+    /// Sequential scan of RECORDS_TABLE on startup.
+    ///
+    /// Populates BOTH `zsets` (weight=1 per key) AND `rows` (bytes per key) in
+    /// a single pass. O(N records) — approximately 40–120ms per million records on SSD.
+    fn rebuild_from_records(&mut self) -> Result<(), SpookyDbError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(RECORDS_TABLE)?;
         for entry in table.iter()? {
-            let (key_guard, _) = entry?;
+            let (key_guard, val_guard) = entry?;
             let key_str: &str = key_guard.value();
             if let Some((table_name, id)) = key_str.split_once(':') {
-                self.zsets
-                    .entry(SmolStr::new(table_name))
-                    .or_default()
-                    .insert(SmolStr::new(id), 1);
+                let t = SmolStr::new(table_name);
+                let i = SmolStr::new(id);
+                let bytes = val_guard.value().to_vec();
+
+                self.zsets.entry(t.clone()).or_default().insert(i.clone(), 1);
+                self.rows.entry(t).or_default().insert(i, bytes);
             }
         }
         Ok(())
@@ -93,10 +106,38 @@ impl SpookyDb {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Build a flat "table:id" redb key.
+/// Build a flat redb key `"table:id"` without a heap allocation.
+///
+/// Uses a stack-allocated `ArrayString<512>`. The combined key must fit
+/// in 512 bytes — table names and ids are expected to be well under this
+/// limit in practice.
+///
+/// # Panics
+/// Panics (debug) / truncates (release) if `table.len() + 1 + id.len() > 512`.
 #[inline]
-fn make_key(table: &str, id: &str) -> String {
-    format!("{}:{}", table, id)
+fn make_key(table: &str, id: &str) -> ArrayString<512> {
+    let mut key = ArrayString::<512>::new();
+    key.push_str(table);
+    key.push(':');
+    key.push_str(id);
+    key
+}
+
+/// Reject table names containing ':' before they can corrupt the flat key namespace.
+///
+/// The "table:id" key format uses ':' as the only separator.
+/// `split_once(':')` in `rebuild_from_records` would mis-parse keys stored
+/// under a table name that itself contains ':', silently moving records to the
+/// wrong table on every restart.
+#[inline]
+fn validate_table_name(table: &str) -> Result<(), SpookyDbError> {
+    if table.contains(':') {
+        Err(SpookyDbError::InvalidKey(format!(
+            "table name must not contain ':': {:?}", table
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 // ─── Write Operations ─────────────────────────────────────────────────────────
@@ -107,6 +148,13 @@ impl SpookyDb {
     /// `data` must be pre-serialized SpookyRecord bytes.
     /// Returns `(zset_key, weight_delta)` for the caller to accumulate into a
     /// `BatchMutationResult` if needed.
+    ///
+    /// # Version tracking
+    ///
+    /// `version: None` means "do not update the version entry". The previous version
+    /// entry (if any) is left unchanged. Callers must provide `version: Some(v)` on
+    /// every mutation where version tracking matters, or accept that `get_version` may
+    /// return a stale value after an update with `version: None`.
     pub fn apply_mutation(
         &mut self,
         table: &str,
@@ -115,23 +163,16 @@ impl SpookyDb {
         data: Option<&[u8]>,
         version: Option<u64>,
     ) -> Result<(SmolStr, i64), SpookyDbError> {
+        validate_table_name(table)?;
+
         let key = make_key(table, id);
         let weight = op.weight();
 
-        // --- In-memory ZSet update ---
-        let zset = self.zsets.entry(SmolStr::new(table)).or_default();
-        if matches!(op, Operation::Delete) {
-            zset.remove(id);
-        } else {
-            zset.insert(SmolStr::new(id), 1);
-        }
-
-        // --- Persist to redb (single transaction) ---
+        // 1. Persist to redb FIRST — if commit fails, in-memory state is untouched.
         let write_txn = self.db.begin_write()?;
         {
             let mut records = write_txn.open_table(RECORDS_TABLE)?;
             let mut versions = write_txn.open_table(VERSION_TABLE)?;
-
             if matches!(op, Operation::Delete) {
                 records.remove(key.as_str())?;
                 versions.remove(key.as_str())?;
@@ -146,7 +187,22 @@ impl SpookyDb {
         }
         write_txn.commit()?;
 
-        Ok((SmolStr::new(&key), weight))
+        // 2. Update in-memory state AFTER successful commit.
+        let zset = self.zsets.entry(SmolStr::new(table)).or_default();
+        let row_table = self.rows.entry(SmolStr::new(table)).or_default();
+
+        if matches!(op, Operation::Delete) {
+            zset.remove(id);
+            row_table.remove(id);
+        } else {
+            zset.insert(SmolStr::new(id), 1);
+            if let Some(bytes) = data {
+                row_table.insert(SmolStr::new(id), bytes.to_vec());
+            }
+        }
+
+        // Return bare id — consistent with apply_batch membership_deltas ZSet key format.
+        Ok((SmolStr::new(id), weight))
     }
 
     /// Batch mutations in **one** write transaction (one fsync).
@@ -160,70 +216,93 @@ impl SpookyDb {
         &mut self,
         mutations: Vec<DbMutation>,
     ) -> Result<BatchMutationResult, SpookyDbError> {
+        // Validate all table names before touching redb.
+        for m in &mutations {
+            validate_table_name(&m.table)?;
+        }
+
+        // Sort by table to improve cache locality on the in-memory writes.
+        // O(n log n) but n is typically small (< 10k) and cheap relative to
+        // redb I/O. The redb write loop also iterates the sorted slice.
+        let mut mutations = mutations;
+        mutations.sort_unstable_by(|a, b| a.table.cmp(&b.table));
+
         let mut membership_deltas: FastMap<SmolStr, ZSet> = FastMap::default();
         let mut content_updates: FastMap<SmolStr, FastHashSet<SmolStr>> = FastMap::default();
-        let mut changed_tables_set: FastHashSet<SmolStr> = FastHashSet::default();
+        let mut changed_tables: Vec<SmolStr> = Vec::new();
 
+        // 1. All redb writes in one transaction.
         let write_txn = self.db.begin_write()?;
         {
             let mut records = write_txn.open_table(RECORDS_TABLE)?;
             let mut versions = write_txn.open_table(VERSION_TABLE)?;
-
-            for mutation in mutations {
-                let DbMutation {
-                    table,
-                    id,
-                    op,
-                    data,
-                    version,
-                } = mutation;
-
-                let key = make_key(&table, &id);
-                let weight = op.weight();
-
-                // In-memory ZSet update.
-                let zset = self.zsets.entry(table.clone()).or_default();
-                if matches!(op, Operation::Delete) {
-                    zset.remove(&id);
-                } else {
-                    zset.insert(id.clone(), 1);
-                }
-
-                // Redb update.
-                if matches!(op, Operation::Delete) {
+            for mutation in &mutations {
+                let key = make_key(&mutation.table, &mutation.id);
+                if matches!(mutation.op, Operation::Delete) {
                     records.remove(key.as_str())?;
                     versions.remove(key.as_str())?;
                 } else {
-                    if let Some(ref bytes) = data {
+                    if let Some(ref bytes) = mutation.data {
                         records.insert(key.as_str(), bytes.as_slice())?;
                     }
-                    if let Some(ver) = version {
+                    if let Some(ver) = mutation.version {
                         versions.insert(key.as_str(), ver)?;
                     }
                 }
+            }
+        }
+        write_txn.commit()?;
 
-                // Accumulate result deltas.
+        // 2. Update in-memory state AFTER successful commit.
+        for mutation in mutations {
+            let DbMutation { table, id, op, data, .. } = mutation;
+
+            let was_present = self
+                .zsets
+                .get(&table)
+                .and_then(|z| z.get(&id))
+                .copied()
+                .unwrap_or(0) > 0;
+
+            let zset = self.zsets.entry(table.clone()).or_default();
+            let row_table = self.rows.entry(table.clone()).or_default();
+
+            if matches!(op, Operation::Delete) {
+                zset.remove(&id);
+                row_table.remove(&id);
+                if was_present {
+                    membership_deltas
+                        .entry(table.clone())
+                        .or_default()
+                        .insert(id.clone(), -1);
+                }
+            } else {
+                zset.insert(id.clone(), 1);
+                if let Some(bytes) = data {
+                    row_table.insert(id.clone(), bytes);
+                }
+                let weight = op.weight();
                 if weight != 0 {
                     membership_deltas
                         .entry(table.clone())
                         .or_default()
                         .insert(id.clone(), weight);
                 }
-                if !matches!(op, Operation::Delete) {
-                    content_updates
-                        .entry(table.clone())
-                        .or_default()
-                        .insert(id.clone());
-                }
-                changed_tables_set.insert(table);
+                content_updates
+                    .entry(table.clone())
+                    .or_default()
+                    .insert(id.clone());
+            }
+
+            if !changed_tables.contains(&table) {
+                changed_tables.push(table);
             }
         }
-        write_txn.commit()?;
 
         Ok(BatchMutationResult {
             membership_deltas,
             content_updates,
-            changed_tables: changed_tables_set.into_iter().collect(),
+            changed_tables,
         })
     }
 
@@ -233,19 +312,31 @@ impl SpookyDb {
     /// hydration or init_load in circuit.rs.
     pub fn bulk_load(
         &mut self,
-        records: impl IntoIterator<Item = BulkRecord>,
+        records: Vec<BulkRecord>,
     ) -> Result<(), SpookyDbError> {
+        for r in &records {
+            validate_table_name(&r.table)?;
+        }
+        // --- 1. Write all records to redb in one transaction ---
         let write_txn = self.db.begin_write()?;
         {
             let mut rec_table = write_txn.open_table(RECORDS_TABLE)?;
-            for record in records {
-                let BulkRecord { table, id, data } = record;
-                let key = make_key(&table, &id);
-                rec_table.insert(key.as_str(), data.as_slice())?;
-                self.zsets.entry(table).or_default().insert(id, 1);
+            let mut ver_table = write_txn.open_table(VERSION_TABLE)?;
+            for record in &records {
+                let key = make_key(&record.table, &record.id);
+                rec_table.insert(key.as_str(), record.data.as_slice())?;
+                if let Some(ver) = record.version {
+                    ver_table.insert(key.as_str(), ver)?;
+                }
             }
         }
         write_txn.commit()?;
+
+        // --- 2. Update in-memory state after successful commit ---
+        for BulkRecord { table, id, data, .. } in records {
+            self.zsets.entry(table.clone()).or_default().insert(id.clone(), 1);
+            self.rows.entry(table).or_default().insert(id, data);
+        }
         Ok(())
     }
 }
@@ -253,39 +344,35 @@ impl SpookyDb {
 // ─── Read Operations ──────────────────────────────────────────────────────────
 
 impl SpookyDb {
-    /// Fetch raw SpookyRecord bytes for a record.
+    /// Fetch a copy of the raw SpookyRecord bytes for a record.
     ///
-    /// Returns `None` if the record does not exist.
-    /// The returned `Vec<u8>` is a copy out of the redb memory-mapped region
-    /// (one unavoidable allocation — data must outlive the read transaction).
+    /// Served from the in-memory row cache — zero I/O, no redb transaction.
+    /// Returns `None` if the record is not present (ZSet weight = 0).
     ///
-    /// **ZSet guard**: checks the in-memory ZSet first (O(1) hash lookup).
-    /// If the record is absent from the ZSet it cannot be in redb — the
-    /// `begin_read()` call is skipped entirely. Critical for join probe loops
-    /// where many lookups miss.
+    /// For the view evaluation hot path where you need a borrowed reference
+    /// without copying, use `get_row_record` instead.
     ///
     /// Usage:
     /// ```rust,ignore
-    /// let bytes = db.get_record_bytes("users", "alice")?.unwrap();
-    /// let (buf, count) = from_bytes(&bytes)?;
+    /// let bytes = db.get_record_bytes("users", "alice").unwrap();
+    /// let (buf, count) = from_bytes(&bytes).unwrap();
     /// let record = SpookyRecord::new(buf, count);
     /// let age = record.get_i64("age");
     /// ```
-    pub fn get_record_bytes(
-        &self,
-        table: &str,
-        id: &str,
-    ) -> Result<Option<Vec<u8>>, SpookyDbError> {
-        // O(1) ZSet guard — avoids redb read transaction for missing keys.
-        if self.get_zset_weight(table, id) == 0 {
-            return Ok(None);
-        }
-        let key = make_key(table, id);
-        let read_txn = self.db.begin_read()?;
-        let tbl = read_txn.open_table(RECORDS_TABLE)?;
-        Ok(tbl
-            .get(key.as_str())?
-            .map(|guard: redb::AccessGuard<&[u8]>| guard.value().to_vec()))
+    pub fn get_record_bytes(&self, table: &str, id: &str) -> Option<Vec<u8>> {
+        self.rows.get(table)?.get(id).cloned()
+    }
+
+    /// Zero-copy borrowed SpookyRecord for the view evaluation hot path.
+    ///
+    /// Returns a `SpookyRecord<'a>` borrowing directly from the in-memory row cache.
+    /// Valid until the next `&mut self` call on this `SpookyDb`.
+    ///
+    /// Zero allocation, zero I/O — O(1) table lookup + O(1) id lookup.
+    pub fn get_row_record<'a>(&'a self, table: &str, id: &str) -> Option<SpookyRecord<'a>> {
+        let bytes = self.rows.get(table)?.get(id)?;
+        let (buf, count) = from_bytes(bytes).ok()?;
+        Some(SpookyRecord::new(buf, count))
     }
 
     /// Reconstruct a partial `SpookyValue::Object` from a stored record.
@@ -304,7 +391,7 @@ impl SpookyDb {
         id: &str,
         fields: &[&str],
     ) -> Result<Option<SpookyValue>, SpookyDbError> {
-        let raw = match self.get_record_bytes(table, id)? {
+        let raw = match self.get_record_bytes(table, id) {
             Some(b) => b,
             None => return Ok(None),
         };
@@ -324,7 +411,24 @@ impl SpookyDb {
     /// Version for a record (sync / conflict detection).
     ///
     /// Returns `None` if the record has no version entry.
+    ///
+    /// Fast path: if the record is not in the ZSet (weight = 0), it cannot
+    /// have a version entry — returns `None` without opening a redb transaction.
     pub fn get_version(&self, table: &str, id: &str) -> Result<Option<u64>, SpookyDbError> {
+        // Fast path: absent from ZSet → definitely not in VERSION_TABLE.
+        let present = self
+            .zsets
+            .get(table)
+            .and_then(|z| z.get(id))
+            .copied()
+            .unwrap_or(0)
+            > 0;
+        if !present {
+            return Ok(None);
+        }
+
+        // Slow path: record is present — check VERSION_TABLE (version is not
+        // cached in memory; a record may exist with no version entry).
         let key = make_key(table, id);
         let read_txn = self.db.begin_read()?;
         let tbl = read_txn.open_table(VERSION_TABLE)?;
@@ -355,15 +459,23 @@ impl SpookyDb {
             .unwrap_or(0)
     }
 
-    /// Apply a pre-computed ZSet delta in memory only (no redb write).
+    /// Applies a pre-computed ZSet delta to the in-memory state.
     ///
-    /// Used when records were already committed (e.g. after a checkpoint load)
-    /// and only the in-memory ZSet needs syncing.
-    pub fn apply_zset_delta_memory(&mut self, table: &str, delta: &ZSet) {
+    /// This is `pub(crate)` because it is intended only for checkpoint-recovery paths
+    /// where the delta has already been validated and committed to disk. Do not call
+    /// this from general application code — use `apply_mutation` or `apply_batch` instead,
+    /// which maintain ZSet/disk atomicity.
+    #[allow(dead_code)]
+    pub(crate) fn apply_zset_delta_memory(&mut self, table: &str, delta: &ZSet) {
         let zset = self.zsets.entry(SmolStr::new(table)).or_default();
         for (id, weight) in delta {
             let entry = zset.entry(id.clone()).or_insert(0);
             *entry += weight;
+            debug_assert!(
+                *entry == 0 || *entry == 1,
+                "apply_zset_delta_memory: weight out of range after delta {weight}: got {entry}",
+                entry = *entry
+            );
             // Remove entries that have reached zero weight.
             if *entry == 0 {
                 zset.remove(id);
@@ -395,10 +507,16 @@ impl SpookyDb {
         self.zsets.get(table).map(|z| z.len()).unwrap_or(0)
     }
 
-    /// Explicitly register an empty table.
+    /// Ensures an in-memory ZSet entry exists for `table`.
     ///
-    /// Creates an empty ZSet entry so `table_exists()` returns `true` even
-    /// before the first record is inserted. The table name must not contain ':'.
+    /// This guarantees that subsequent calls to `get_table_zset` return `Some(&ZSet)`
+    /// rather than `None`, even before any records are inserted. However, `table_exists`
+    /// checks whether the ZSet is non-empty — an ensured but empty table still returns
+    /// `false` from `table_exists`.
+    ///
+    /// Use this to pre-allocate the ZSet slot before bulk operations.
+    ///
+    /// The table name must not contain ':'.
     pub fn ensure_table(&mut self, table: &str) {
         self.zsets.entry(SmolStr::new(table)).or_default();
     }
@@ -416,9 +534,18 @@ pub trait DbBackend {
     /// Zero-copy ZSet access. Borrowed from memory — zero I/O.
     fn get_table_zset(&self, table: &str) -> Option<&ZSet>;
 
-    /// Raw bytes for a record. Caller wraps in `SpookyRecord`.
-    /// ZSet-guarded: returns `None` without I/O for keys absent from the ZSet.
+    /// Raw bytes for a record, served from in-memory cache.
+    /// Returns `None` if the record is absent. Zero I/O — never fails.
     fn get_record_bytes(&self, table: &str, id: &str) -> Option<Vec<u8>>;
+
+    /// Zero-copy borrowed record access. Returns `None` if the record is absent.
+    ///
+    /// Default implementation returns `None` (falls back to `get_record_bytes` for
+    /// backends without an in-memory row cache). Backends with an in-memory row
+    /// cache should override this for hot-path efficiency.
+    fn get_row_record_bytes<'a>(&'a self, _table: &str, _id: &str) -> Option<&'a [u8]> {
+        None
+    }
 
     /// Register an empty table.
     fn ensure_table(&mut self, table: &str);
@@ -442,7 +569,7 @@ pub trait DbBackend {
     /// Bulk initial load.
     fn bulk_load(
         &mut self,
-        records: impl IntoIterator<Item = BulkRecord>,
+        records: Vec<BulkRecord>,
     ) -> Result<(), SpookyDbError>;
 
     /// Weight for one record. Returns 0 if absent.
@@ -455,7 +582,11 @@ impl DbBackend for SpookyDb {
     }
 
     fn get_record_bytes(&self, table: &str, id: &str) -> Option<Vec<u8>> {
-        self.get_record_bytes(table, id).ok().flatten()
+        SpookyDb::get_record_bytes(self, table, id)
+    }
+
+    fn get_row_record_bytes<'a>(&'a self, table: &str, id: &str) -> Option<&'a [u8]> {
+        self.rows.get(table)?.get(id).map(|v| v.as_slice())
     }
 
     fn ensure_table(&mut self, table: &str) {
@@ -482,7 +613,7 @@ impl DbBackend for SpookyDb {
 
     fn bulk_load(
         &mut self,
-        records: impl IntoIterator<Item = BulkRecord>,
+        records: Vec<BulkRecord>,
     ) -> Result<(), SpookyDbError> {
         SpookyDb::bulk_load(self, records)
     }
@@ -500,6 +631,31 @@ mod tests {
     use crate::serialization::from_cbor;
     use tempfile::NamedTempFile;
 
+    // BENCH_CBOR: a pre-serialized CBOR map (12 fields) representing a realistic
+    // user record. Used by all test helpers that need pre-built SpookyRecord bytes.
+    //
+    // Fields and values (as CBOR):
+    //   active:      true                              (bool)
+    //   age:         28                                (uint/i64)
+    //   count:       1000                              (uint)
+    //   deleted:     false                             (bool)
+    //   history:     [{action:"login",  timestamp:1234567890},
+    //                 {action:"update", timestamp:1234567900}]  (array of 2 objects)
+    //   id:          "user:abc123"                     (str)
+    //   metadata:    null
+    //   mixed_array: [42, "text", true, {nested:"value"}]       (array of 4)
+    //   name:        "Alice"                           (str)
+    //   profile:     {avatar:"https://example.com/avatar.jpg",
+    //                 bio:"Software engineer",
+    //                 settings:{notifications:true,
+    //                           privacy:{level:3, public:false},
+    //                           theme:"dark"}}         (nested object)
+    //   score:       99.5                              (f64)
+    //   tags:        ["developer", "rust", "database"] (array of 3 strings)
+    //
+    // Regenerate: build a cbor4ii::core::Value::Map with the above fields, call
+    // `from_cbor(&val)` to obtain the SpookyRecord bytes, and print them as a
+    // Rust byte-array literal.
     const BENCH_CBOR: &[u8] = &[
         172, 102, 97, 99, 116, 105, 118, 101, 245, 99, 97, 103, 101, 24, 28, 101, 99, 111, 117,
         110, 116, 25, 3, 232, 103, 100, 101, 108, 101, 116, 101, 100, 244, 103, 104, 105, 115,
@@ -546,7 +702,7 @@ mod tests {
         assert_eq!(db.get_zset_weight("users", "alice"), 1);
 
         // Get raw bytes back
-        let fetched = db.get_record_bytes("users", "alice")?.expect("should exist");
+        let fetched = db.get_record_bytes("users", "alice").expect("should exist");
         assert_eq!(fetched, data);
 
         // Version
@@ -555,7 +711,7 @@ mod tests {
         // Delete
         db.apply_mutation("users", Operation::Delete, "alice", None, None)?;
         assert_eq!(db.get_zset_weight("users", "alice"), 0);
-        assert!(db.get_record_bytes("users", "alice")?.is_none());
+        assert!(db.get_record_bytes("users", "alice").is_none());
         assert_eq!(db.table_len("users"), 0);
 
         Ok(())
@@ -618,11 +774,13 @@ mod tests {
                 table: SmolStr::new("items"),
                 id: SmolStr::new("i1"),
                 data: data.clone(),
+                version: None,
             },
             BulkRecord {
                 table: SmolStr::new("items"),
                 id: SmolStr::new("i2"),
                 data: data.clone(),
+                version: None,
             },
         ];
 
@@ -702,5 +860,139 @@ mod tests {
         // But table_names() still lists it.
         let names: Vec<&SmolStr> = db.table_names().collect();
         assert!(names.contains(&&SmolStr::new("empty_table")));
+    }
+
+    #[test]
+    fn test_row_cache_populated_on_create() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = NamedTempFile::new()?;
+        let mut db = SpookyDb::new(tmp.path())?;
+        let cbor: cbor4ii::core::Value = cbor4ii::serde::from_slice(BENCH_CBOR)?;
+        let (data, _) = from_cbor(&cbor)?;
+
+        db.apply_mutation("users", Operation::Create, "alice", Some(&data), None)?;
+
+        // get_record_bytes must return without touching redb.
+        assert_eq!(db.get_record_bytes("users", "alice"), Some(data.clone()));
+
+        // get_row_record must return a valid borrowed record.
+        let record = db.get_row_record("users", "alice").expect("should be in cache");
+        let age = record.get_i64("age");
+        assert!(age.is_some(), "age field should be readable from cached record");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_row_cache_evicted_on_delete() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = NamedTempFile::new()?;
+        let mut db = SpookyDb::new(tmp.path())?;
+        let cbor: cbor4ii::core::Value = cbor4ii::serde::from_slice(BENCH_CBOR)?;
+        let (data, _) = from_cbor(&cbor)?;
+
+        db.apply_mutation("users", Operation::Create, "alice", Some(&data), None)?;
+        db.apply_mutation("users", Operation::Delete, "alice", None, None)?;
+
+        assert_eq!(db.get_record_bytes("users", "alice"), None);
+        assert!(db.get_row_record("users", "alice").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_row_cache_rebuilt_on_reopen() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempfile::tempdir()?;
+        let db_path = tmp_dir.path().join("test.redb");
+        let cbor: cbor4ii::core::Value = cbor4ii::serde::from_slice(BENCH_CBOR)?;
+        let (data, _) = from_cbor(&cbor)?;
+
+        {
+            let mut db = SpookyDb::new(&db_path)?;
+            db.apply_mutation("users", Operation::Create, "alice", Some(&data), None)?;
+        }
+
+        // After reopen, row cache must be rebuilt from redb.
+        let db2 = SpookyDb::new(&db_path)?;
+        assert_eq!(db2.get_record_bytes("users", "alice"), Some(data));
+        let record = db2.get_row_record("users", "alice").expect("must be in cache after reopen");
+        assert!(record.get_i64("age").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_table_name_with_colon_rejected() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut db = SpookyDb::new(tmp.path()).unwrap();
+        let result = db.apply_mutation("a:b", Operation::Create, "id1", Some(&[]), None);
+        assert!(matches!(result, Err(SpookyDbError::InvalidKey(_))));
+    }
+
+    #[test]
+    fn test_zset_not_diverged_after_create() -> Result<(), Box<dyn std::error::Error>> {
+        // Verify that ZSet and rows are in sync after apply_mutation.
+        let tmp = NamedTempFile::new()?;
+        let mut db = SpookyDb::new(tmp.path())?;
+        let cbor: cbor4ii::core::Value = cbor4ii::serde::from_slice(BENCH_CBOR)?;
+        let (data, _) = from_cbor(&cbor)?;
+
+        db.apply_mutation("users", Operation::Create, "alice", Some(&data), None)?;
+        assert_eq!(db.get_zset_weight("users", "alice"), 1);
+        assert!(db.get_record_bytes("users", "alice").is_some());
+
+        db.apply_mutation("users", Operation::Delete, "alice", None, None)?;
+        assert_eq!(db.get_zset_weight("users", "alice"), 0);
+        assert!(db.get_record_bytes("users", "alice").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_nonexistent_emits_no_delta() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = NamedTempFile::new()?;
+        let mut db = SpookyDb::new(tmp.path())?;
+
+        let result = db.apply_batch(vec![DbMutation {
+            table: SmolStr::new("users"),
+            id: SmolStr::new("ghost"),
+            op: Operation::Delete,
+            data: None,
+            version: None,
+        }])?;
+
+        // No record was present → membership_deltas must be empty.
+        assert!(
+            result.membership_deltas.get("users").map_or(true, |z| z.is_empty()),
+            "spurious -1 delta emitted for a record that never existed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_dyn_dbbackend_compiles() {
+        // This test exists purely to assert DbBackend is object-safe.
+        // It will fail to compile if bulk_load still uses impl IntoIterator.
+        let tmp = NamedTempFile::new().unwrap();
+        let db = SpookyDb::new(tmp.path()).unwrap();
+        let _: Box<dyn DbBackend> = Box::new(db);
+    }
+
+    #[test]
+    fn test_get_row_record_zero_copy() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = NamedTempFile::new()?;
+        let mut db = SpookyDb::new(tmp.path())?;
+
+        let cbor: cbor4ii::core::Value = cbor4ii::serde::from_slice(BENCH_CBOR)?;
+        let (data, _) = from_cbor(&cbor)?;
+
+        // Non-existent record returns None.
+        assert!(db.get_row_record("users", "alice").is_none());
+
+        // Insert a record, then verify we can read a field from the zero-copy view.
+        db.apply_mutation("users", Operation::Create, "alice", Some(&data), None)?;
+
+        let record = db.get_row_record("users", "alice").expect("should be in cache");
+        // The CBOR fixture has "age" = 28 (i64).
+        let age = record.get_i64("age");
+        assert!(age.is_some(), "age field should be readable from cached record");
+        assert_eq!(age.unwrap(), 28);
+
+        Ok(())
     }
 }

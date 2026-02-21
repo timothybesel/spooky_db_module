@@ -13,6 +13,15 @@ pub struct SpookyRecord<'a> {
 impl<'a> SpookyRecord<'a> {
     #[inline]
     pub fn new(data_buf: &'a [u8], field_count: usize) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            // Verify caller-provided field_count matches the header.
+            let header_count = u32::from_le_bytes(data_buf[0..4].try_into().expect("buf too short")) as usize;
+            debug_assert_eq!(
+                field_count, header_count,
+                "SpookyRecord::new: caller field_count {field_count} != header {header_count}"
+            );
+        }
         Self {
             data_buf,
             field_count,

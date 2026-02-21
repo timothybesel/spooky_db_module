@@ -2,6 +2,7 @@ use rustc_hash::FxHasher;
 use smol_str::SmolStr;
 use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
+use thiserror::Error;
 
 pub type Weight = i64;
 pub type RowKey = SmolStr;
@@ -9,30 +10,22 @@ pub type FastMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHa
 pub type FastHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 pub type ZSet = FastMap<RowKey, Weight>;
 
-#[derive(Debug)]
+/// Alias for table names — documents that this string must not contain ':'.
+pub type TableName = SmolStr;
+
+/// Per-table in-memory row cache. Key: record_id → serialized SpookyRecord bytes.
+/// Serves all read calls; redb is write-through only.
+pub type RowStore = FastMap<RowKey, Vec<u8>>;
+
+#[derive(Debug, Error)]
 pub enum SpookyDbError {
-    Redb(redb::Error),
+    #[error("redb error: {0}")]
+    Redb(#[from] redb::Error),
+    #[error("serialization error: {0}")]
     Serialization(String),
     /// Table name contains ':' or key format is otherwise invalid.
+    #[error("invalid key: {0}")]
     InvalidKey(String),
-}
-
-impl std::fmt::Display for SpookyDbError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SpookyDbError::Redb(e) => write!(f, "redb error: {}", e),
-            SpookyDbError::Serialization(s) => write!(f, "serialization error: {}", s),
-            SpookyDbError::InvalidKey(s) => write!(f, "invalid key: {}", s),
-        }
-    }
-}
-
-impl std::error::Error for SpookyDbError {}
-
-impl From<redb::Error> for SpookyDbError {
-    fn from(e: redb::Error) -> Self {
-        SpookyDbError::Redb(e)
-    }
 }
 
 impl From<redb::DatabaseError> for SpookyDbError {
@@ -76,6 +69,11 @@ impl From<crate::error::RecordError> for SpookyDbError {
 /// `data` MUST be pre-serialized SpookyRecord bytes (from `from_cbor` /
 /// `serialize_into`). Serialization happens BEFORE `begin_write()` to
 /// minimize write lock hold time.
+///
+/// # Limits
+///
+/// Records are capped at 32 fields. Attempting to serialize a record with more
+/// than 32 fields returns [`SpookyDbError`] wrapping `RecordError::TooManyFields`.
 pub struct DbMutation {
     pub table: SmolStr,
     pub id: SmolStr,
@@ -83,6 +81,13 @@ pub struct DbMutation {
     /// `None` for `Delete`; `Some(bytes)` for `Create` / `Update`.
     pub data: Option<Vec<u8>>,
     /// Explicit version. If `None`, VERSION_TABLE entry is left unchanged.
+    ///
+    /// # Version tracking
+    ///
+    /// `version: None` means "do not update the version entry". The previous version
+    /// entry (if any) is left unchanged. Callers must provide `version: Some(v)` on
+    /// every mutation where version tracking matters, or accept that `get_version` may
+    /// return a stale value after an update with `version: None`.
     pub version: Option<u64>,
 }
 
@@ -98,7 +103,7 @@ pub enum Operation {
 
 impl Operation {
     /// Weight delta this operation contributes to the ZSet.
-    pub fn weight(self) -> i64 {
+    pub fn weight(&self) -> i64 {
         match self {
             Operation::Create => 1,
             Operation::Delete => -1,
@@ -124,4 +129,6 @@ pub struct BulkRecord {
     pub table: SmolStr,
     pub id: SmolStr,
     pub data: Vec<u8>,
+    /// Written to VERSION_TABLE when `Some`. Pass `None` to skip version tracking.
+    pub version: Option<u64>,
 }

@@ -237,7 +237,6 @@ impl<T: RecordSerialize> RecordSerialize for &T {
 ///
 /// **IMPORTANT**: The index is sorted by name_hash. This is required for
 /// O(log n) binary search in both SpookyRecord and SpookyRecordMut.
-
 /// Serialize a single field value into (bytes, type_tag).
 #[inline]
 pub fn write_field_into<V: RecordSerialize>(
@@ -291,8 +290,8 @@ pub fn write_field_into<V: RecordSerialize>(
             .map_err(|e| RecordError::CborError(e.to_string()))?;
         TAG_NESTED_CBOR
     } else {
-        // Unknown type — treat as null
-        TAG_NULL
+        // Unknown type — cannot serialize, return error
+        return Err(RecordError::UnknownTypeTag(0));
     })
 }
 
@@ -359,7 +358,7 @@ pub fn serialize<V: RecordSerialize>(
     // so we can write by index (buf[idx] = ...) immediately.
     buf.resize(data_start, 0);
 
-    prepare_buf(&map, &mut buf, field_count)?;
+    prepare_buf(map, &mut buf, field_count)?;
 
     // 5. Return
     Ok((buf, field_count))
@@ -417,6 +416,23 @@ pub fn from_bytes(buf: &[u8]) -> Result<(&[u8], usize), RecordError> {
     if buf.len() < min_size {
         return Err(RecordError::InvalidBuffer);
     }
+    #[cfg(debug_assertions)]
+    {
+        let index_start = HEADER_SIZE;
+        let index_entry_size = INDEX_ENTRY_SIZE;
+        if field_count > 1 {
+            for i in 0..field_count - 1 {
+                let a_off = index_start + i * index_entry_size;
+                let b_off = index_start + (i + 1) * index_entry_size;
+                let a_hash = u64::from_le_bytes(buf[a_off..a_off + 8].try_into().unwrap());
+                let b_hash = u64::from_le_bytes(buf[b_off..b_off + 8].try_into().unwrap());
+                debug_assert!(
+                    a_hash <= b_hash,
+                    "from_bytes: index not sorted at position {i}: hash {a_hash:#x} > {b_hash:#x}"
+                );
+            }
+        }
+    }
     Ok((buf, field_count))
 }
 
@@ -441,7 +457,7 @@ pub fn serialize_into<V: RecordSerialize>(
     buf.reserve(data_start + field_count * 16);
     buf.resize(data_start, 0);
 
-    prepare_buf(&map, buf, field_count)?;
+    prepare_buf(map, buf, field_count)?;
     // 5. Return
     Ok(field_count)
 }

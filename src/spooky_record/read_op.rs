@@ -87,7 +87,7 @@ pub trait SpookyReadable {
         if n <= 4 {
             return self.linear_hash_search(n, hash);
         }
-        return self.binary_hash_search(n, hash);
+        self.binary_hash_search(n, hash)
     }
 
     // ════════════════════════════════════════════════════════════════════════
