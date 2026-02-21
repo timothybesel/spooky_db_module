@@ -518,9 +518,11 @@ impl SpookyDb {
     ///
     /// Use this to pre-allocate the ZSet slot before bulk operations.
     ///
-    /// The table name must not contain ':'.
-    pub fn ensure_table(&mut self, table: &str) {
+    /// Returns `Err(SpookyDbError::InvalidKey)` if the table name contains `':'`.
+    pub fn ensure_table(&mut self, table: &str) -> Result<(), SpookyDbError> {
+        validate_table_name(table)?;
         self.zsets.entry(SmolStr::new(table)).or_default();
+        Ok(())
     }
 }
 
@@ -550,7 +552,9 @@ pub trait DbBackend {
     }
 
     /// Register an empty table.
-    fn ensure_table(&mut self, table: &str);
+    ///
+    /// Returns `Err(SpookyDbError::InvalidKey)` if `table` contains `':'`.
+    fn ensure_table(&mut self, table: &str) -> Result<(), SpookyDbError>;
 
     /// Single mutation: record write + ZSet update.
     fn apply_mutation(
@@ -576,6 +580,18 @@ pub trait DbBackend {
 
     /// Weight for one record. Returns 0 if absent.
     fn get_zset_weight(&self, table: &str, id: &str) -> i64;
+
+    /// Reconstruct a partial `SpookyValue::Object` from a stored record.
+    ///
+    /// Only fields whose names are listed in `fields` are included. Field names
+    /// are not recoverable from hashes — callers must supply the expected names.
+    /// Returns `Ok(None)` if the record does not exist.
+    fn get_record_typed(
+        &self,
+        table: &str,
+        id: &str,
+        fields: &[&str],
+    ) -> Result<Option<SpookyValue>, SpookyDbError>;
 }
 
 impl DbBackend for SpookyDb {
@@ -591,8 +607,8 @@ impl DbBackend for SpookyDb {
         self.rows.get(table)?.get(id).map(|v| v.as_slice())
     }
 
-    fn ensure_table(&mut self, table: &str) {
-        self.ensure_table(table);
+    fn ensure_table(&mut self, table: &str) -> Result<(), SpookyDbError> {
+        SpookyDb::ensure_table(self, table)
     }
 
     fn apply_mutation(
@@ -622,6 +638,15 @@ impl DbBackend for SpookyDb {
 
     fn get_zset_weight(&self, table: &str, id: &str) -> i64 {
         self.get_zset_weight(table, id)
+    }
+
+    fn get_record_typed(
+        &self,
+        table: &str,
+        id: &str,
+        fields: &[&str],
+    ) -> Result<Option<SpookyValue>, SpookyDbError> {
+        SpookyDb::get_record_typed(self, table, id, fields)
     }
 }
 
@@ -855,13 +880,19 @@ mod tests {
         let mut db = SpookyDb::new(tmp.path()).unwrap();
 
         assert!(!db.table_exists("empty_table"));
-        db.ensure_table("empty_table");
+        db.ensure_table("empty_table").unwrap();
         // ensure_table creates the ZSet entry, but table_exists checks for non-empty.
         // An empty ZSet → table_exists returns false (no records yet).
         assert!(!db.table_exists("empty_table"));
         // But table_names() still lists it.
         let names: Vec<&SmolStr> = db.table_names().collect();
         assert!(names.contains(&&SmolStr::new("empty_table")));
+
+        // Table names containing ':' must be rejected.
+        assert!(matches!(
+            db.ensure_table("bad:table"),
+            Err(SpookyDbError::InvalidKey(_))
+        ));
     }
 
     #[test]
