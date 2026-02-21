@@ -3,7 +3,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RecordError {
-    #[error("Can't Serialize none Object Types")]
+    #[error("cannot serialize non-object types")]
     SerializationNotObject,
     #[error("Invalid buffer structure")]
     InvalidBuffer,

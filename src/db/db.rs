@@ -294,7 +294,9 @@ impl SpookyDb {
                     .insert(id.clone());
             }
 
-            if !changed_tables.contains(&table) {
+            // Mutations are sorted by table, so consecutive entries share the same table.
+            // Compare against the last pushed value instead of scanning the whole vec.
+            if changed_tables.last() != Some(&table) {
                 changed_tables.push(table);
             }
         }
