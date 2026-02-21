@@ -2,6 +2,7 @@ use rustc_hash::FxHasher;
 use smol_str::SmolStr;
 use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
+use std::num::NonZeroUsize;
 use thiserror::Error;
 
 pub type Weight = i64;
@@ -13,9 +14,24 @@ pub type ZSet = FastMap<RowKey, Weight>;
 /// Alias for table names — documents that this string must not contain ':'.
 pub type TableName = SmolStr;
 
-/// Per-table in-memory row cache. Key: record_id → serialized SpookyRecord bytes.
-/// Serves all read calls; redb is write-through only.
-pub type RowStore = FastMap<RowKey, Vec<u8>>;
+/// Configuration for [`SpookyDb::new_with_config`].
+pub struct SpookyDbConfig {
+    /// Maximum number of records to keep in the LRU row cache.
+    ///
+    /// When this limit is reached, the least-recently-written record is evicted.
+    /// Evicted records remain on disk in redb and are re-read on the next access.
+    ///
+    /// Default: 10 000 records (~10–500 MB depending on average record size).
+    pub cache_capacity: NonZeroUsize,
+}
+
+impl Default for SpookyDbConfig {
+    fn default() -> Self {
+        Self {
+            cache_capacity: NonZeroUsize::new(10_000).unwrap(),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SpookyDbError {

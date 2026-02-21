@@ -5,8 +5,8 @@ use redb::{Database as RedbDatabase, ReadableDatabase, ReadableTable, TableDefin
 use smol_str::SmolStr;
 
 use super::types::{
-    BatchMutationResult, BulkRecord, DbMutation, FastHashSet, FastMap, Operation, RowStore,
-    SpookyDbError, TableName, ZSet,
+    BatchMutationResult, BulkRecord, DbMutation, FastHashSet, FastMap, Operation,
+    SpookyDbConfig, SpookyDbError, ZSet,
 };
 use crate::serialization::from_bytes;
 use crate::spooky_record::{SpookyReadable, SpookyRecord};
@@ -45,23 +45,38 @@ pub struct SpookyDb {
     /// Weight 1 = record present; absent = deleted.
     zsets: FastMap<SmolStr, ZSet>,
 
-    /// In-memory row cache. Key: table_name → (record_id → SpookyRecord bytes).
+    /// Bounded LRU row cache. Key: (table_name, record_id) → SpookyRecord bytes.
     ///
-    /// Primary read source for all view evaluation. Zero I/O on reads.
-    /// Written on every Create/Update; evicted on Delete.
-    /// Rebuilt from RECORDS_TABLE on startup (same scan as `zsets`).
-    rows: FastMap<TableName, RowStore>,
+    /// Write-through: populated on every Create/Update/bulk_load. Evicts the
+    /// least-recently-written entry when capacity is reached. On cache miss,
+    /// `get_record_bytes` falls back to a redb read. The cache starts cold on
+    /// every open — ZSet is rebuilt from a full scan but record bytes are NOT
+    /// pre-loaded.
+    row_cache: lru::LruCache<(SmolStr, SmolStr), Vec<u8>>,
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
 
 impl SpookyDb {
-    /// Open or create the database at `path`.
+    /// Open or create the database at `path` with default cache capacity (10 000 records).
     ///
     /// Initialises redb tables on first open. Rebuilds all in-memory ZSets
     /// from a sequential RECORDS_TABLE scan — O(N records), ~20–100ms per
-    /// million records on an SSD.
+    /// million records on an SSD. The LRU row cache starts cold.
     pub fn new(path: impl AsRef<Path>) -> Result<Self, SpookyDbError> {
+        Self::new_with_config(path, SpookyDbConfig::default())
+    }
+
+    /// Open or create the database at `path` with explicit configuration.
+    ///
+    /// `config.cache_capacity` bounds peak memory for record bytes. Records beyond
+    /// this limit are evicted from memory and re-read from redb on demand.
+    /// Setting a capacity larger than the total number of records is equivalent
+    /// to the old full-memory design (but without the startup pre-load cost).
+    pub fn new_with_config(
+        path: impl AsRef<Path>,
+        config: SpookyDbConfig,
+    ) -> Result<Self, SpookyDbError> {
         let db = RedbDatabase::create(path)?;
 
         // Ensure tables exist (idempotent).
@@ -75,7 +90,7 @@ impl SpookyDb {
         let mut spooky = SpookyDb {
             db,
             zsets: FastMap::default(),
-            rows: FastMap::default(),
+            row_cache: lru::LruCache::new(config.cache_capacity),
         };
         spooky.rebuild_from_records()?;
         Ok(spooky)
@@ -83,21 +98,21 @@ impl SpookyDb {
 
     /// Sequential scan of RECORDS_TABLE on startup.
     ///
-    /// Populates BOTH `zsets` (weight=1 per key) AND `rows` (bytes per key) in
-    /// a single pass. O(N records) — approximately 40–120ms per million records on SSD.
+    /// Rebuilds `zsets` (weight=1 per key) in a single pass — O(N records),
+    /// approximately 20–80ms per million records on SSD. The LRU row cache
+    /// starts cold; it warms as records are written or read via `get_record_bytes`.
+    ///
+    /// Startup memory: only ZSet keys (one SmolStr per record) — no record bytes loaded.
     fn rebuild_from_records(&mut self) -> Result<(), SpookyDbError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(RECORDS_TABLE)?;
         for entry in table.iter()? {
-            let (key_guard, val_guard) = entry?;
+            let (key_guard, _val_guard) = entry?;
             let key_str: &str = key_guard.value();
             if let Some((table_name, id)) = key_str.split_once(':') {
                 let t = SmolStr::new(table_name);
                 let i = SmolStr::new(id);
-                let bytes = val_guard.value().to_vec();
-
-                self.zsets.entry(t.clone()).or_default().insert(i.clone(), 1);
-                self.rows.entry(t).or_default().insert(i, bytes);
+                self.zsets.entry(t).or_default().insert(i, 1);
             }
         }
         Ok(())
@@ -189,15 +204,17 @@ impl SpookyDb {
 
         // 2. Update in-memory state AFTER successful commit.
         let zset = self.zsets.entry(SmolStr::new(table)).or_default();
-        let row_table = self.rows.entry(SmolStr::new(table)).or_default();
 
         if matches!(op, Operation::Delete) {
             zset.remove(id);
-            row_table.remove(id);
+            self.row_cache.pop(&(SmolStr::new(table), SmolStr::new(id)));
         } else {
             zset.insert(SmolStr::new(id), 1);
             if let Some(bytes) = data {
-                row_table.insert(SmolStr::new(id), bytes.to_vec());
+                self.row_cache.put(
+                    (SmolStr::new(table), SmolStr::new(id)),
+                    bytes.to_vec(),
+                );
             }
         }
 
@@ -265,11 +282,10 @@ impl SpookyDb {
                 .unwrap_or(0) > 0;
 
             let zset = self.zsets.entry(table.clone()).or_default();
-            let row_table = self.rows.entry(table.clone()).or_default();
 
             if matches!(op, Operation::Delete) {
                 zset.remove(&id);
-                row_table.remove(&id);
+                self.row_cache.pop(&(table.clone(), id.clone()));
                 if was_present {
                     membership_deltas
                         .entry(table.clone())
@@ -279,7 +295,7 @@ impl SpookyDb {
             } else {
                 zset.insert(id.clone(), 1);
                 if let Some(bytes) = data {
-                    row_table.insert(id.clone(), bytes);
+                    self.row_cache.put((table.clone(), id.clone()), bytes);
                 }
                 let weight = op.weight();
                 if weight != 0 {
@@ -337,7 +353,7 @@ impl SpookyDb {
         // --- 2. Update in-memory state after successful commit ---
         for BulkRecord { table, id, data, .. } in records {
             self.zsets.entry(table.clone()).or_default().insert(id.clone(), 1);
-            self.rows.entry(table).or_default().insert(id, data);
+            self.row_cache.put((table, id), data);
         }
         Ok(())
     }
@@ -348,11 +364,14 @@ impl SpookyDb {
 impl SpookyDb {
     /// Fetch a copy of the raw SpookyRecord bytes for a record.
     ///
-    /// Served from the in-memory row cache — zero I/O, no redb transaction.
-    /// Returns `None` if the record is not present (ZSet weight = 0).
+    /// **Fast path** (cache hit): `peek()` from the LRU row cache — zero I/O, ~50 ns.
+    /// **Slow path** (cache miss): opens a redb read transaction — ~1–10 µs on warm OS cache.
     ///
-    /// For the view evaluation hot path where you need a borrowed reference
-    /// without copying, use `get_row_record` instead.
+    /// Returns `None` if the record is absent from the ZSet (deleted or never written).
+    ///
+    /// Cache misses do NOT populate the cache (requires `&self`). The cache is written
+    /// only by Create/Update/bulk_load paths. Use `get_row_record` on the write→read
+    /// hot path; fall back to this method when `get_row_record` returns `None`.
     ///
     /// Usage:
     /// ```rust,ignore
@@ -362,17 +381,59 @@ impl SpookyDb {
     /// let age = record.get_i64("age");
     /// ```
     pub fn get_record_bytes(&self, table: &str, id: &str) -> Option<Vec<u8>> {
-        self.rows.get(table)?.get(id).cloned()
+        // ZSet guard — avoids unnecessary redb open for absent records.
+        let present = self
+            .zsets
+            .get(table)
+            .and_then(|z| z.get(id))
+            .copied()
+            .unwrap_or(0)
+            > 0;
+        if !present {
+            return None;
+        }
+
+        // Cache hit — peek does not update LRU recency (requires &mut self).
+        let cache_key = (SmolStr::new(table), SmolStr::new(id));
+        if let Some(bytes) = self.row_cache.peek(&cache_key) {
+            return Some(bytes.clone());
+        }
+
+        // Cache miss — fall back to redb.
+        let db_key = make_key(table, id);
+        let read_txn = self.db.begin_read().ok()?;
+        let tbl = read_txn.open_table(RECORDS_TABLE).ok()?;
+        tbl.get(db_key.as_str())
+            .ok()?
+            .map(|guard| guard.value().to_vec())
     }
 
     /// Zero-copy borrowed SpookyRecord for the view evaluation hot path.
     ///
-    /// Returns a `SpookyRecord<'a>` borrowing directly from the in-memory row cache.
-    /// Valid until the next `&mut self` call on this `SpookyDb`.
+    /// Returns `Some(SpookyRecord<'a>)` if and only if the record is in the LRU row cache.
+    /// Returns `None` if the record is absent **or** if it exists on disk but has been
+    /// evicted from the cache.
     ///
-    /// Zero allocation, zero I/O — O(1) table lookup + O(1) id lookup.
+    /// **Cache miss fallback**: call `get_record_bytes(table, id)` which reads from redb.
+    ///
+    /// For the streaming pipeline hot path (write then read in the same tick), records
+    /// are always in the cache — writes populate it immediately. Zero I/O, zero allocation.
     pub fn get_row_record<'a>(&'a self, table: &str, id: &str) -> Option<SpookyRecord<'a>> {
-        let bytes = self.rows.get(table)?.get(id)?;
+        // ZSet guard — avoid cache lookup for absent records.
+        let present = self
+            .zsets
+            .get(table)
+            .and_then(|z| z.get(id))
+            .copied()
+            .unwrap_or(0)
+            > 0;
+        if !present {
+            return None;
+        }
+
+        // Cache-only — peek returns &Vec<u8> with lifetime 'a.
+        let cache_key = (SmolStr::new(table), SmolStr::new(id));
+        let bytes = self.row_cache.peek(&cache_key)?;
         let (buf, count) = from_bytes(bytes).ok()?;
         Some(SpookyRecord::new(buf, count))
     }
@@ -604,7 +665,9 @@ impl DbBackend for SpookyDb {
     }
 
     fn get_row_record_bytes<'a>(&'a self, table: &str, id: &str) -> Option<&'a [u8]> {
-        self.rows.get(table)?.get(id).map(|v| v.as_slice())
+        // Cache-only — None on cache miss (same semantics as get_row_record).
+        let cache_key = (SmolStr::new(table), SmolStr::new(id));
+        self.row_cache.peek(&cache_key).map(|v| v.as_slice())
     }
 
     fn ensure_table(&mut self, table: &str) -> Result<(), SpookyDbError> {
@@ -942,11 +1005,20 @@ mod tests {
             db.apply_mutation("users", Operation::Create, "alice", Some(&data), None)?;
         }
 
-        // After reopen, row cache must be rebuilt from redb.
+        // After reopen: ZSet is rebuilt from RECORDS_TABLE; LRU cache starts cold.
         let db2 = SpookyDb::new(&db_path)?;
+
+        // ZSet is correct — record is known present.
+        assert_eq!(db2.get_zset_weight("users", "alice"), 1);
+
+        // get_record_bytes falls back to redb on cache miss — still returns data.
         assert_eq!(db2.get_record_bytes("users", "alice"), Some(data));
-        let record = db2.get_row_record("users", "alice").expect("must be in cache after reopen");
-        assert!(record.get_i64("age").is_some());
+
+        // get_row_record returns None because the cache is cold after reopen.
+        assert!(
+            db2.get_row_record("users", "alice").is_none(),
+            "cold cache: get_row_record must return None until a write warms the entry"
+        );
         Ok(())
     }
 
@@ -1004,6 +1076,132 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let db = SpookyDb::new(tmp.path()).unwrap();
         let _: Box<dyn DbBackend> = Box::new(db);
+    }
+
+    #[test]
+    fn test_cache_miss_falls_back_to_redb() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempfile::tempdir()?;
+        let db_path = tmp_dir.path().join("test.redb");
+        let cbor: cbor4ii::core::Value = cbor4ii::serde::from_slice(BENCH_CBOR)?;
+        let (data, _) = from_cbor(&cbor)?;
+
+        // Write a record and close the DB.
+        {
+            let mut db = SpookyDb::new(&db_path)?;
+            db.apply_mutation("users", Operation::Create, "alice", Some(&data), None)?;
+        }
+
+        // Reopen — cache is cold but ZSet is rebuilt.
+        let db2 = SpookyDb::new(&db_path)?;
+        assert_eq!(db2.get_zset_weight("users", "alice"), 1); // ZSet present
+
+        // get_row_record returns None (cold cache after reopen).
+        assert!(db2.get_row_record("users", "alice").is_none());
+
+        // get_record_bytes falls back to redb — still returns data.
+        let fetched = db2
+            .get_record_bytes("users", "alice")
+            .expect("redb fallback must work on cache miss");
+        assert_eq!(fetched, data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cache_eviction_correctness() -> Result<(), Box<dyn std::error::Error>> {
+        // Cache capacity 2, insert 3 records. 3rd insert evicts the 1st.
+        // Verify: ZSet has all 3; get_record_bytes works for all 3 (redb fallback);
+        // get_row_record returns None for the evicted record.
+        let tmp = NamedTempFile::new()?;
+        let mut db = SpookyDb::new_with_config(
+            tmp.path(),
+            SpookyDbConfig {
+                cache_capacity: std::num::NonZeroUsize::new(2).unwrap(),
+            },
+        )?;
+
+        let cbor: cbor4ii::core::Value = cbor4ii::serde::from_slice(BENCH_CBOR)?;
+        let (data, _) = from_cbor(&cbor)?;
+
+        db.apply_mutation("t", Operation::Create, "r1", Some(&data), None)?;
+        db.apply_mutation("t", Operation::Create, "r2", Some(&data), None)?;
+        db.apply_mutation("t", Operation::Create, "r3", Some(&data), None)?; // evicts r1
+
+        // ZSet has all 3.
+        assert_eq!(db.get_zset_weight("t", "r1"), 1);
+        assert_eq!(db.get_zset_weight("t", "r2"), 1);
+        assert_eq!(db.get_zset_weight("t", "r3"), 1);
+
+        // get_record_bytes works for all 3 (redb fallback for evicted r1).
+        assert!(db.get_record_bytes("t", "r1").is_some(), "redb fallback for evicted r1");
+        assert!(db.get_record_bytes("t", "r2").is_some());
+        assert!(db.get_record_bytes("t", "r3").is_some());
+
+        // get_row_record: r1 evicted, r2 and r3 still in cache.
+        assert!(db.get_row_record("t", "r1").is_none(), "r1 should be evicted from cache");
+        assert!(db.get_row_record("t", "r2").is_some(), "r2 should still be in cache");
+        assert!(db.get_row_record("t", "r3").is_some(), "r3 should be in cache");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cache_capacity_bounds_memory() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = NamedTempFile::new()?;
+        let mut db = SpookyDb::new_with_config(
+            tmp.path(),
+            SpookyDbConfig {
+                cache_capacity: std::num::NonZeroUsize::new(5).unwrap(),
+            },
+        )?;
+
+        let cbor: cbor4ii::core::Value = cbor4ii::serde::from_slice(BENCH_CBOR)?;
+        let (data, _) = from_cbor(&cbor)?;
+
+        // Insert 10 records into a cache of capacity 5.
+        for i in 0u32..10 {
+            let id = format!("r{i}");
+            db.apply_mutation("t", Operation::Create, &id, Some(&data), None)?;
+        }
+
+        // ZSet has all 10.
+        assert_eq!(db.table_len("t"), 10);
+
+        // Cache has at most 5.
+        let cached_count = (0u32..10)
+            .filter(|i| db.get_row_record("t", &format!("r{i}")).is_some())
+            .count();
+        assert!(cached_count <= 5, "cache exceeded capacity: {cached_count} entries cached");
+
+        // get_record_bytes works for all 10 via redb fallback.
+        for i in 0u32..10 {
+            let id = format!("r{i}");
+            assert!(
+                db.get_record_bytes("t", &id).is_some(),
+                "redb fallback failed for r{i}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_removes_from_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = NamedTempFile::new()?;
+        let mut db = SpookyDb::new(tmp.path())?;
+        let cbor: cbor4ii::core::Value = cbor4ii::serde::from_slice(BENCH_CBOR)?;
+        let (data, _) = from_cbor(&cbor)?;
+
+        db.apply_mutation("t", Operation::Create, "r1", Some(&data), None)?;
+        assert!(db.get_row_record("t", "r1").is_some(), "r1 should be in cache after create");
+
+        db.apply_mutation("t", Operation::Delete, "r1", None, None)?;
+        // ZSet and cache must both be gone; ZSet guard prevents redb read.
+        assert_eq!(db.get_zset_weight("t", "r1"), 0);
+        assert!(db.get_row_record("t", "r1").is_none());
+        assert!(db.get_record_bytes("t", "r1").is_none());
+
+        Ok(())
     }
 
     #[test]

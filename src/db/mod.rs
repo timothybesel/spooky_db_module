@@ -4,6 +4,6 @@ pub mod types;
 
 pub use db::{DbBackend, SpookyDb};
 pub use types::{
-    BatchMutationResult, BulkRecord, DbMutation, FastHashSet, FastMap, Operation, RowStore,
+    BatchMutationResult, BulkRecord, DbMutation, FastHashSet, FastMap, Operation, SpookyDbConfig,
     SpookyDbError, TableName, ZSet,
 };
