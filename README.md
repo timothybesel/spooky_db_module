@@ -1,12 +1,18 @@
-# 👻 SpookyDB Module
+# SpookyDB Module
 
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/timothybesel/spooky_db_module?utm_source=badge)
 
-A high-performance, zero-copy binary record format for Rust with embedded persistence. SpookyDB serializes structured data into a compact hybrid format with **O(log n) field lookups**, **O(1) cached access via FieldSlots**, **nanosecond-level mutation**, and **transactional disk persistence** via redb — no parsing required until you access a field.
+Structured records that are slow to serialize and expensive to parse at scale make streaming pipelines bottleneck on I/O and allocation — SpookyDB stores records in a binary format that requires no parsing before field access, keeps membership state in memory for zero-I/O view queries, and persists to an embedded ACID store with one fsync per batch.
+
+**What it does**: O(log n) field lookups with no parsing, O(1) cached access via FieldSlots, nanosecond-level in-place mutation, ZSet-guarded reads that skip disk for absent records, and an LRU row cache that serves recently-written records with zero I/O.
+
+**What makes it different**: The binary format separates the sorted hash index from field data, so typed reads are a hash lookup + two-pointer dereference on a `&[u8]` — no serde, no enum traversal, no allocation. All three value types (`SpookyValue`, `serde_json::Value`, `cbor4ii::core::Value`) serialize to the same format without intermediate conversion.
+
+---
 
 ## Architecture
 
-SpookyDB uses a **hybrid binary format** that combines native encoding for flat fields with CBOR for nested data. It abstracts over value types using the `RecordSerialize` and `RecordDeserialize` traits, allowing seamless interoperability between `SpookyValue`, `serde_json::Value`, and `cbor4ii::core::Value`. The persistence layer stores serialized records in redb with in-memory ZSets for zero-I/O membership queries.
+SpookyDB uses a **hybrid binary format** that combines native encoding for flat fields with CBOR for nested data. It abstracts over value types using the `RecordSerialize` and `RecordDeserialize` traits, allowing seamless interoperability between `SpookyValue`, `serde_json::Value`, and `cbor4ii::core::Value`. The persistence layer stores serialized records in redb with in-memory ZSets for zero-I/O membership queries and a bounded LRU row cache for zero-I/O reads on recently-written records.
 
 ```
    ┌─────────────────────────────────────────────────────────────┐
@@ -34,11 +40,14 @@ SpookyDB uses a **hybrid binary format** that combines native encoding for flat 
                            ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │   SpookyDb (Persistence Layer)                                     │
-│   ├── RECORDS_TABLE  ── redb ── "table:id" → &[u8]                │
-│   ├── VERSION_TABLE  ── redb ── "table:id" → u64                  │
-│   └── ZSets (in-memory) ── FastMap<SmolStr, ZSet>                  │
-│       • zero I/O membership queries                                │
-│       • rebuilt from RECORDS_TABLE on startup                       │
+│   ├── RECORDS_TABLE  ── redb ── "table:id" → &[u8]                 │
+│   ├── VERSION_TABLE  ── redb ── "table:id" → u64                   │
+│   ├── ZSets (in-memory) ── FastMap<SmolStr, ZSet>                  │
+│   │   • zero I/O membership queries                                │
+│   │   • rebuilt from RECORDS_TABLE on startup                      │
+│   └── LRU row cache ── bounded in-memory Vec<u8> per record        │
+│       • write-through on Create/Update/bulk_load                   │
+│       • cache miss falls back to redb                              │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -60,68 +69,103 @@ SpookyDB uses a **hybrid binary format** that combines native encoding for flat 
 └───────────────────────────────────────────────────────────┘
 ```
 
+Field names are hashed with xxh64 and stored in the sorted index. The names themselves are not stored — they cannot be recovered from a serialized record without an external schema. This is a deliberate performance trade-off: field lookups are a hash + binary search on a `u64` slice with no string comparisons.
+
+> See also: [Architecture](docs/ARCHITECTURE.md) | [Full API Reference](docs/API.md)
+
+---
+
+## Quick Start
+
+### Installation
+
+Add to `Cargo.toml`:
+
+```toml
+[dependencies]
+spooky_db_module = { path = "..." }
+```
+
+**What SpookyDb does to your system**: opening a database creates or opens a single `.redb` file at the path you provide. No other files are written. No background threads are spawned. No network connections are made. To remove all data, delete the `.redb` file. No special permissions beyond normal file I/O are required.
+
+---
+
 ## Usage
 
 ### Creating Records
 
 ```rust
-use spooky_db_module::spooky_value::SpookyValue;
-use spooky_db_module::serialization::{serialize, from_cbor};
+use spooky_db_module::serialization::{serialize, from_bytes};
 use spooky_db_module::spooky_record::SpookyRecord;
-use spooky_db_module::spooky_record_mut::SpookyRecordMut;
-use serde_json::json;
+use spooky_db_module::spooky_record::read_op::SpookyReadable;
+use spooky_db_module::spooky_record::record_mut::SpookyRecordMut;
+use spooky_db_module::spooky_value::SpookyValue;
+use smol_str::SmolStr;
+use std::collections::BTreeMap;
 
-// 1. Serialize from SpookyValue
-let data = SpookyValue::from(json!({"name": "Alice", "age": 30}));
-let (bytes, count) = serialize(&data.as_map().unwrap()).unwrap();
+// 1. Serialize from a BTreeMap<SmolStr, V> where V: RecordSerialize
+let mut map = BTreeMap::new();
+map.insert(SmolStr::new("name"), SpookyValue::Str(SmolStr::new("Alice")));
+map.insert(SmolStr::new("age"),  SpookyValue::Number(30i64.into()));
+let (bytes, count) = serialize(&map).unwrap();
 
-// 2. Immutable zero-copy access
+// 2. Immutable zero-copy access (borrows the buffer, implements Copy)
 let record = SpookyRecord::new(&bytes, count);
-let name = record.get_str("name");                // Option<&str> — zero-copy
-let age  = record.get_i64("age");                 // Option<i64>
-let val: SpookyValue = record.get_field("age").unwrap(); // Generic get
+let name = record.get_str("name");           // Option<&str> — zero-copy
+let age  = record.get_i64("age");            // Option<i64>
+let val: Option<SpookyValue> = record.get_field("age"); // generic
 
 // 3. Mutable in-place access
-let mut rec = SpookyRecordMut::new(bytes, count);
-rec.set_i64("age", 29).unwrap();                  // ~6 ns
-rec.set_str("name", "Bobby").unwrap();            // ~13 ns (same len)
+let mut rec = SpookyRecordMut::new(bytes.clone(), count);
+rec.set_i64("age", 29).unwrap();             // ~6 ns
+rec.set_str("name", "Bobby").unwrap();       // ~13 ns (same length)
 
-// 4. Generic Setters (works with any RecordSerialize type)
-rec.add_field("active", &true).unwrap();          // generic boolean
-rec.set_field("meta", &json!({"foo": "bar"})).unwrap(); // generic JSON
+// 4. Generic setters (any RecordSerialize type)
+rec.add_field("active", &true).unwrap();
 ```
 
 ### FieldSlot Cached Access (O(1))
 
-For hot paths where the same fields are read/written repeatedly (e.g. DBSP change detection), resolve a field once and access it via cached `FieldSlot` — **up to 14x faster** than by-name lookups:
+For hot paths where the same fields are read or written repeatedly (e.g. DBSP change detection), resolve a field once and access it via a cached `FieldSlot` — up to 14x faster than by-name lookups:
 
 ```rust
-// Resolve once — O(log n) binary search
+use spooky_db_module::spooky_record::read_op::SpookyReadable;
+use spooky_db_module::spooky_record::record_mut::SpookyRecordMut;
+
+// Resolve once — O(log n) binary search, caches offset + type tag
 let age_slot = rec.resolve("age").unwrap();
 
-// Read via slot — O(1), no hashing, no search (~1 ns)
-let age = rec.get_i64_at(&age_slot);       // Some(29)
+// Read via slot — O(1), no hashing, no search (~1.5 ns)
+let age = rec.get_i64_at(&age_slot);         // Some(29)
 
 // Write via slot — O(1), in-place (~0.6 ns)
 rec.set_i64_at(&age_slot, 30).unwrap();
+
+// Slots are invalidated by structural mutations (add_field, remove_field,
+// variable-length string splice). Staleness is caught by debug_assert in
+// all _at methods — zero overhead in release builds.
 ```
 
 ### Buffer Reuse for Bulk Serialization
 
-Eliminate per-record heap allocations when serializing many records (**~17% faster**):
+Eliminate per-record heap allocations when serializing many records (~17% faster):
 
 ```rust
 use spooky_db_module::serialization::serialize_into;
+use smol_str::SmolStr;
+use std::collections::BTreeMap;
 
-// Serialize thousands of records with one allocation
+// One allocation; reused across all records
 let mut buf = Vec::new();
-for record in incoming_stream {
-    serialize_into(&record, &mut buf)?;
-    store.put(key, &buf);  // buf reused on next iteration
+for map in incoming_stream {
+    let _field_count = serialize_into(&map, &mut buf).unwrap();
+    store.put(key, &buf); // buf is reused on the next iteration
 }
 ```
 
 ### SpookyRecord (Immutable)
+
+`SpookyRecord<'a>` borrows `&'a [u8]` and implements `Copy`. All read methods come from the `SpookyReadable` trait.
 
 | Method | Returns | Description |
 |---|---|---|
@@ -130,52 +174,68 @@ for record in incoming_stream {
 | `get_u64(name)` | `Option<u64>` | Read u64 field |
 | `get_f64(name)` | `Option<f64>` | Read f64 field |
 | `get_bool(name)` | `Option<bool>` | Read bool field |
-| `get_field<V>(name)` | `Option<V>` | **Generic**: Deserialize any field to `V` |
-| `get_raw(name)` | `Option<FieldRef>` | Raw field reference |
-| `get_number_as_f64(name)` | `Option<f64>` | Any numeric → f64 |
+| `get_field::<V>(name)` | `Option<V>` | Generic: deserialize any field to `V` |
+| `get_raw(name)` | `Option<FieldRef>` | Raw field reference (zero-copy) |
+| `get_number_as_f64(name)` | `Option<f64>` | Any numeric type promoted to f64 |
 | `has_field(name)` | `bool` | Existence check |
-| `iter_fields()` | `FieldIter` | Iterate raw fields |
-| `field_count()` | `u32` | Number of fields |
+| `field_type(name)` | `Option<u8>` | Raw type tag |
+| `iter_fields()` | `FieldIter` | Iterate all raw fields |
+| `field_count()` | `usize` | Number of fields |
+| `resolve(name)` | `Option<FieldSlot>` | Cache field position for O(1) future access |
+| `get_i64_at(&slot)` | `Option<i64>` | O(1) cached read |
+| `get_u64_at(&slot)` | `Option<u64>` | O(1) cached read |
+| `get_f64_at(&slot)` | `Option<f64>` | O(1) cached read |
+| `get_bool_at(&slot)` | `Option<bool>` | O(1) cached read |
+| `get_str_at(&slot)` | `Option<&str>` | O(1) cached zero-copy read |
 
 ### SpookyRecordMut (Mutable)
+
+`SpookyRecordMut` owns `Vec<u8>` and carries a `generation` counter. Fixed-width writes leave the generation unchanged. Structural mutations (add/remove field, variable-length string splice) increment it, invalidating any outstanding `FieldSlot`.
 
 | Method | Description |
 |---|---|
 | `new(Vec<u8>, usize)` | Create from existing buffer |
 | `new_empty()` | Create empty record |
-| **By-name access** | |
+| `as_record()` | Zero-copy `SpookyRecord<'_>` view over the mutable buffer |
+| **By-name writes** | |
 | `set_i64(name, val)` | In-place i64 overwrite |
 | `set_u64(name, val)` | In-place u64 overwrite |
 | `set_f64(name, val)` | In-place f64 overwrite |
 | `set_bool(name, val)` | In-place bool overwrite |
-| `set_str(name, val)` | String set (splice if needed) |
-| `set_str_exact(name, val)` | Same-length string only |
-| `set_field<V>(name, &V)` | **Generic**: Set any `RecordSerialize` value |
+| `set_str(name, val)` | In-place if same byte length, splice if different |
+| `set_str_exact(name, val)` | Same-length only; returns `LengthMismatch` otherwise |
+| `set_field::<V>(name, &V)` | Generic: set any `RecordSerialize` value |
 | `set_null(name)` | Set field to null |
-| `add_field<V>(name, &V)` | **Generic**: Add new field |
-| `remove_field(name)` | Remove field |
+| `add_field::<V>(name, &V)` | Generic: add a new field (full buffer rebuild) |
+| `remove_field(name)` | Remove field (full buffer rebuild) |
 | **FieldSlot cached access** | |
-| `resolve(name)` | Resolve field → `FieldSlot` |
-| `get_*_at(&slot)` | O(1) cached read |
-| `set_*_at(&slot, val)` | O(1) cached write |
+| `resolve(name)` | Resolve field into a `FieldSlot` |
+| `get_*_at(&slot)` | O(1) cached read (inherited from `SpookyReadable`) |
+| `set_i64_at(&slot, val)` | O(1) cached write |
+| `set_u64_at(&slot, val)` | O(1) cached write |
+| `set_f64_at(&slot, val)` | O(1) cached write |
+| `set_bool_at(&slot, val)` | O(1) cached write |
+| `set_str_at(&slot, val)` | O(1) same-length write; returns `LengthMismatch` on length change |
 
 ### Supported Types
 
-The module supports generic serialization via `RecordSerialize` and `RecordDeserialize`:
+`RecordSerialize` and `RecordDeserialize` are implemented for all three value types — records can be written from or read into any of them without intermediate conversion:
 
-- `SpookyValue`: Dynamic value enum (Null, Bool, Number, Str, Array, Object)
-- `serde_json::Value`: Standard JSON types
-- `cbor4ii::core::Value`: Low-level CBOR types
+- `SpookyValue`: native dynamic enum (`Null`, `Bool`, `Number(SpookyNumber)`, `Str(SmolStr)`, `Array`, `Object`)
+- `serde_json::Value`: standard JSON types
+- `cbor4ii::core::Value`: low-level CBOR types
+
+---
 
 ## Persistence Layer
 
-SpookyDb provides transactional disk persistence backed by [redb](https://github.com/cberner/redb), an embedded key-value store. Records are stored as pre-serialized SpookyRecord bytes with flat composite keys (`"table_name:record_id"`). ZSets (membership weight maps) are kept entirely in memory for zero-I/O view evaluation, and rebuilt from a full table scan on startup.
+SpookyDb provides transactional disk persistence backed by [redb](https://github.com/cberner/redb), an embedded key-value store. Records are stored as pre-serialized SpookyRecord bytes with flat composite keys (`"table_name:record_id"`). ZSets (membership weight maps) live entirely in memory for zero-I/O view evaluation and are rebuilt from a full table scan on startup. A bounded LRU row cache serves recently-written records with zero I/O.
 
 ### Design Rules
 
 > 1. **One write transaction per batch** — `apply_batch` groups N mutations into a single redb write transaction (one fsync), regardless of how many records or tables are touched.
 > 2. **ZSets always in memory** — membership queries (`get_table_zset`, `get_zset_weight`) never touch disk. ZSets are rebuilt from `RECORDS_TABLE` on startup.
-> 3. **Records always on disk** — record bytes live in redb. The ZSet acts as an O(1) guard: reads for absent records skip redb entirely.
+> 3. **LRU row cache** — recently written records are served from a bounded in-memory LRU cache (default 10 000 records). Cache misses fall back to redb. `get_row_record` returns `None` on miss — it is not guaranteed to return bytes if a record exists but has been evicted.
 
 Table names must not contain `':'`. Record IDs may contain `':'` (the key format uses `split_once` on the first `':'`).
 
@@ -184,28 +244,31 @@ Table names must not contain `':'`. Record IDs may contain `':'` (the key format
 Pre-serialize all records on the caller side (CPU work, no lock held), then submit the batch for a single transactional commit:
 
 ```rust
-use spooky_db_module::db::{SpookyDb, DbMutation, Operation};
+use spooky_db_module::db::db::SpookyDb;
+use spooky_db_module::db::types::{DbMutation, Operation};
 use spooky_db_module::serialization::serialize;
 use spooky_db_module::spooky_value::SpookyValue;
-use serde_json::json;
+use smol_str::SmolStr;
+use std::collections::BTreeMap;
 
-// Open or create database
+// Open or create database (default cache: 10 000 records)
 let mut db = SpookyDb::new("my_data.redb").unwrap();
 
 // Pre-serialize records (CPU work, no lock)
-let val = SpookyValue::from(json!({"name": "Alice", "age": 30, "spooky_rv": 1}));
-let (bytes, _count) = serialize(&val.as_map().unwrap()).unwrap();
+let mut map = BTreeMap::new();
+map.insert(SmolStr::new("name"), SpookyValue::Str(SmolStr::new("Alice")));
+map.insert(SmolStr::new("age"),  SpookyValue::Number(30i64.into()));
+let (bytes, _count) = serialize(&map).unwrap();
 
 // Build a batch of mutations
 let mutations = vec![
     DbMutation {
-        table: "users".into(),
-        id: "user:abc123".into(),
+        table: SmolStr::new("users"),
+        id: SmolStr::new("user:abc123"),
         op: Operation::Create,
         data: Some(bytes),
         version: Some(1),
     },
-    // ... more mutations
 ];
 
 // Single transaction, single fsync
@@ -217,25 +280,34 @@ let result = db.apply_batch(mutations).unwrap();
 
 ### Read Path
 
-ZSet-guarded reads skip redb entirely when a record is absent:
+For the write-then-read pipeline hot path, records written in the same tick are always in the LRU cache — zero I/O, zero allocation:
 
 ```rust
+use spooky_db_module::db::db::SpookyDb;
 use spooky_db_module::serialization::from_bytes;
 use spooky_db_module::spooky_record::SpookyRecord;
+use spooky_db_module::spooky_record::read_op::SpookyReadable;
 
-// Zero I/O — pure memory lookup for view evaluation
+// Zero I/O — pure memory ZSet lookup for view evaluation
 let zset = db.get_table_zset("users");
 
-// ZSet-guarded read — O(1) check before touching disk
-if let Some(bytes) = db.get_record_bytes("users", "user:abc123").unwrap() {
-    let (buf, count) = from_bytes(&bytes).unwrap();
-    let record = SpookyRecord::new(buf, count);
-    let name = record.get_str("name");   // Option<&str>, zero-copy
-    let age  = record.get_i64("age");    // Option<i64>
+// Fast path: record in LRU cache — zero I/O, borrowed SpookyRecord<'_>
+if let Some(record) = db.get_row_record("users", "user:abc123") {
+    let name = record.get_str("name"); // Option<&str>, zero-copy
+    let age  = record.get_i64("age");  // Option<i64>
 }
 
-// Partial reconstruction — only named fields are recovered
-let partial = db.get_record_typed("users", "user:abc123", &["name", "age"]).unwrap();
+// Fallback: cache miss — ZSet guard → redb read, returns owned Vec<u8>
+if let Some(bytes) = db.get_record_bytes("users", "user:abc123") {
+    let (buf, count) = from_bytes(&bytes).unwrap();
+    let record = SpookyRecord::new(buf, count);
+    let age = record.get_i64("age");
+}
+
+// Partial reconstruction — supply field names; they are not stored in the binary format
+let partial = db
+    .get_record_typed("users", "user:abc123", &["name", "age"])
+    .unwrap();
 ```
 
 ### SpookyDb API
@@ -244,23 +316,25 @@ let partial = db.get_record_typed("users", "user:abc123", &["name", "age"]).unwr
 
 | Method | Description |
 |---|---|
-| `SpookyDb::new(path)` | Open/create database, initialize tables, rebuild ZSets from disk (O(N) startup scan) |
+| `SpookyDb::new(path)` | Open/create database with default config (10 000 record LRU cache). Rebuilds all ZSets from `RECORDS_TABLE` on startup — O(N records). Cache starts cold. |
+| `SpookyDb::new_with_config(path, SpookyDbConfig)` | Open/create with explicit configuration (e.g. custom `cache_capacity`). |
 
 #### Write Operations (`&mut self`)
 
-| Method | Description |
-|---|---|
-| `apply_mutation(table, op, id, data, version)` | Single record + ZSet update in one transaction |
-| `apply_batch(mutations: Vec<DbMutation>)` | **N records in ONE transaction (one fsync)** — the critical performance path |
-| `bulk_load(records)` | Initial hydration from an iterator of `BulkRecord`, single transaction |
+| Method | Signature | Description |
+|---|---|---|
+| `apply_mutation` | `(table, op, id, data: Option<&[u8]>, version: Option<u64>) -> Result<(SmolStr, i64), SpookyDbError>` | Single record + ZSet update in one transaction |
+| `apply_batch` | `(mutations: Vec<DbMutation>) -> Result<BatchMutationResult, SpookyDbError>` | **N records in ONE transaction (one fsync)** — the critical performance path |
+| `bulk_load` | `(records: Vec<BulkRecord>) -> Result<(), SpookyDbError>` | Initial hydration — all records in one transaction; sets every ZSet weight to 1 |
 
 #### Read Operations (`&self`)
 
-| Method | Description |
-|---|---|
-| `get_record_bytes(table, id)` | ZSet-guarded raw bytes fetch; returns `None` without touching redb if absent |
-| `get_record_typed(table, id, fields)` | Partial field reconstruction; only the named fields are recovered |
-| `get_version(table, id)` | Read the version number for a record |
+| Method | Returns | Description |
+|---|---|---|
+| `get_row_record(table, id)` | `Option<SpookyRecord<'_>>` | Zero-copy borrowed record. Cache-only: returns `None` on cache miss even if the record exists on disk. |
+| `get_record_bytes(table, id)` | `Option<Vec<u8>>` | ZSet guard → LRU peek → redb fallback on miss. Never returns bytes for a deleted or absent record. |
+| `get_record_typed(table, id, fields: &[&str])` | `Result<Option<SpookyValue>, SpookyDbError>` | Partial field reconstruction; only the named fields are recovered (names are not stored in the binary format). |
+| `get_version(table, id)` | `Result<Option<u64>, SpookyDbError>` | Read the stored version number for a record |
 
 #### ZSet Operations (pure memory, zero I/O)
 
@@ -268,18 +342,23 @@ let partial = db.get_record_typed("users", "user:abc123", &["name", "age"]).unwr
 |---|---|
 | `get_table_zset(table)` | Full `&ZSet` borrow for view evaluation (Scan operator) |
 | `get_zset_weight(table, id)` | Membership weight; 0 if absent |
-| `apply_zset_delta_memory(table, delta)` | In-memory delta application for checkpoint recovery |
 
 #### Table Info (pure memory, O(1))
 
 | Method | Description |
 |---|---|
-| `table_exists(table)` | Check if a table has been registered |
+| `table_exists(table)` | `true` if the table has at least one record with positive ZSet weight |
 | `table_names()` | Iterator over all registered table names |
 | `table_len(table)` | Number of records with positive ZSet weight |
-| `ensure_table(table)` | Register an empty table before first insert |
+| `ensure_table(table)` | Pre-allocate the ZSet slot before bulk operations. Returns `Err(InvalidKey)` if table name contains `':'`. |
 
 ### Supporting Types
+
+**`SpookyDbConfig`** — passed to `SpookyDb::new_with_config`:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `cache_capacity` | `NonZeroUsize` | `10_000` | Maximum records in the LRU row cache. Records beyond this limit are evicted and re-read from redb on demand. |
 
 **`Operation`** — the mutation kind for each record in a batch:
 
@@ -293,19 +372,19 @@ let partial = db.get_record_typed("users", "user:abc123", &["name", "age"]).unwr
 
 | Field | Type | Description |
 |---|---|---|
-| `table` | `SmolStr` | Target table name |
+| `table` | `SmolStr` | Target table name (must not contain `':'`) |
 | `id` | `SmolStr` | Record identifier |
 | `op` | `Operation` | Create, Update, or Delete |
 | `data` | `Option<Vec<u8>>` | Pre-serialized SpookyRecord bytes; `None` for Delete |
-| `version` | `Option<u64>` | Explicit version number; `None` = leave unchanged |
+| `version` | `Option<u64>` | Explicit version number; `None` = leave existing version unchanged |
 
 **`BatchMutationResult`** — returned by `apply_batch`:
 
 | Field | Type | Description |
 |---|---|---|
 | `membership_deltas` | `FastMap<SmolStr, ZSet>` | Per-table ZSet weight deltas |
-| `content_updates` | `FastMap<SmolStr, FastHashSet<SmolStr>>` | Per-table set of updated record IDs |
-| `changed_tables` | `Vec<SmolStr>` | List of all affected table names |
+| `content_updates` | `FastMap<SmolStr, FastHashSet<SmolStr>>` | Per-table set of record IDs whose bytes were written |
+| `changed_tables` | `Vec<SmolStr>` | All tables with at least one mutation (deduplicated) |
 
 **`BulkRecord`** — used by `bulk_load` for initial hydration:
 
@@ -314,22 +393,45 @@ let partial = db.get_record_typed("users", "user:abc123", &["name", "age"]).unwr
 | `table` | `SmolStr` | Target table name |
 | `id` | `SmolStr` | Record identifier |
 | `data` | `Vec<u8>` | Pre-serialized SpookyRecord bytes |
+| `version` | `Option<u64>` | Written to `VERSION_TABLE` when `Some`; skipped when `None` |
 
 ### DbBackend Trait
 
-`SpookyDb` implements the `DbBackend` trait, which abstracts over the storage backend. This allows swapping between on-disk persistence and alternative backends (e.g., pure in-memory for testing) without changing caller code:
+`SpookyDb` implements the `DbBackend` trait, which abstracts over the storage backend. This allows swapping between on-disk persistence and alternative backends (e.g. pure in-memory for testing) without changing caller code. The trait is object-safe — `Box<dyn DbBackend>` compiles.
 
 ```rust
 pub trait DbBackend {
     fn get_table_zset(&self, table: &str) -> Option<&ZSet>;
     fn get_record_bytes(&self, table: &str, id: &str) -> Option<Vec<u8>>;
-    fn ensure_table(&mut self, table: &str);
-    fn apply_mutation(&mut self, ...) -> Result<(SmolStr, i64), SpookyDbError>;
-    fn apply_batch(&mut self, mutations: Vec<DbMutation>) -> Result<BatchMutationResult, SpookyDbError>;
-    fn bulk_load(&mut self, records: impl IntoIterator<Item=BulkRecord>) -> Result<(), SpookyDbError>;
+    fn get_row_record_bytes<'a>(&'a self, table: &str, id: &str) -> Option<&'a [u8]>;
+    fn ensure_table(&mut self, table: &str) -> Result<(), SpookyDbError>;
+    fn apply_mutation(
+        &mut self,
+        table: &str,
+        op: Operation,
+        id: &str,
+        data: Option<&[u8]>,
+        version: Option<u64>,
+    ) -> Result<(SmolStr, i64), SpookyDbError>;
+    fn apply_batch(
+        &mut self,
+        mutations: Vec<DbMutation>,
+    ) -> Result<BatchMutationResult, SpookyDbError>;
+    fn bulk_load(
+        &mut self,
+        records: Vec<BulkRecord>,
+    ) -> Result<(), SpookyDbError>;
     fn get_zset_weight(&self, table: &str, id: &str) -> i64;
+    fn get_record_typed(
+        &self,
+        table: &str,
+        id: &str,
+        fields: &[&str],
+    ) -> Result<Option<SpookyValue>, SpookyDbError>;
 }
 ```
+
+---
 
 ## Benchmarks
 
@@ -418,16 +520,16 @@ A `generation` counter on `SpookyRecordMut` tracks layout changes. Fixed-width w
 
 | Operation | By Name | FieldSlot | Speedup |
 |---|---|---|---|
-| `get_i64` | **9.13 ns** | **1.48 ns** | 6.2× |
-| `get_str` | **9.55 ns** | **3.87 ns** | 2.5× |
-| `get_bool` | **9.10 ns** | **0.94 ns** | 9.7× |
-| `get_f64` | **11.65 ns** | **1.00 ns** | 11.6× |
-| `set_i64` | **8.84 ns** | **0.64 ns** | 13.8× |
-| `set_str` (same len) | **9.74 ns** | **4.37 ns** | 2.2× |
+| `get_i64` | **9.13 ns** | **1.48 ns** | 6.2x |
+| `get_str` | **9.55 ns** | **3.87 ns** | 2.5x |
+| `get_bool` | **9.10 ns** | **0.94 ns** | 9.7x |
+| `get_f64` | **11.65 ns** | **1.00 ns** | 11.6x |
+| `set_i64` | **8.84 ns** | **0.64 ns** | 13.8x |
+| `set_str` (same len) | **9.74 ns** | **4.37 ns** | 2.2x |
 
 ### Buffer Reuse: Bulk Serialization
 
-`serialize_into` and `from_spooky_value_into` reuse a caller-provided `Vec<u8>`, clearing it but retaining its heap allocation. This eliminates the per-record `Vec::new()` + allocation cost that dominates when serializing many records in sequence (sync ingestion, snapshot rebuild). The buffer naturally grows to the high-water mark and stays there.
+`serialize_into` reuses a caller-provided `Vec<u8>`, clearing it but retaining its heap allocation. This eliminates the per-record `Vec::new()` + allocation cost that dominates when serializing many records in sequence (sync ingestion, snapshot rebuild). The buffer naturally grows to the high-water mark and stays there.
 
 | Operation | Fresh Alloc | Reused Buffer | Improvement |
 |---|---|---|---|
@@ -469,24 +571,31 @@ cargo bench --bench spooky_bench -- reading_values
 cargo bench --bench spooky_bench -- fieldslot
 cargo bench --bench spooky_bench -- buffer_reuse
 
-# Quick smoke test
+# Quick smoke test (no timing, just correctness)
 cargo bench --bench spooky_bench -- --test
 
 # View HTML reports
 open target/criterion/report/index.html
 ```
 
+---
+
 ## Dependencies
 
-| Crate | Purpose |
-|---|---|
-| `redb` | Embedded transactional key-value store for record persistence |
-| `rustc-hash` | FxHasher-based `HashMap`/`HashSet` for in-memory ZSets |
-| `cbor4ii` | Fast, zero-copy CBOR encoding/decoding |
-| `xxhash-rust` | Fast 64-bit hashing for field name lookups |
-| `smol_str` | Small-string-optimized string type |
-| `serde` | Serialization framework |
-| `serde_json` | JSON support |
+| Crate | Version | Purpose |
+|---|---|---|
+| `redb` | `3.1.0` | Embedded transactional key-value store for record persistence |
+| `lru` | `0.12` | Bounded LRU row cache for zero-I/O reads on recently-written records |
+| `rustc-hash` | `2.1.1` | FxHasher-based `HashMap`/`HashSet` for in-memory ZSets |
+| `cbor4ii` | `1.2.2` | Fast, zero-copy CBOR encoding/decoding |
+| `xxhash-rust` | `0.8.15` | Fast 64-bit hashing for field name lookups |
+| `smol_str` | `0.3.5` | Small-string-optimized string type |
+| `arrayvec` | `0.7.6` | Stack-allocated sort buffer (caps records at 32 fields) |
+| `serde` | `1.0` | Serialization framework |
+| `serde_json` | `1.0` | JSON support |
+| `thiserror` | `1` | Error type derivation |
+
+---
 
 ## License
 
