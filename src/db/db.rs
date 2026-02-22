@@ -146,13 +146,18 @@ fn make_key(table: &str, id: &str) -> ArrayString<512> {
 /// wrong table on every restart.
 #[inline]
 fn validate_table_name(table: &str) -> Result<(), SpookyDbError> {
-    if table.contains(':') {
-        Err(SpookyDbError::InvalidKey(format!(
-            "table name must not contain ':': {:?}", table
-        )))
-    } else {
-        Ok(())
+    if table.is_empty() {
+        return Err(SpookyDbError::InvalidKey(
+            "table name must not be empty".into(),
+        ));
     }
+    if table.contains(':') {
+        return Err(SpookyDbError::InvalidKey(format!(
+            "table name must not contain ':': received {:?}",
+            table
+        )));
+    }
+    Ok(())
 }
 
 // ─── Write Operations ─────────────────────────────────────────────────────────
@@ -367,7 +372,8 @@ impl SpookyDb {
     /// **Fast path** (cache hit): `peek()` from the LRU row cache — zero I/O, ~50 ns.
     /// **Slow path** (cache miss): opens a redb read transaction — ~1–10 µs on warm OS cache.
     ///
-    /// Returns `None` if the record is absent from the ZSet (deleted or never written).
+    /// Returns `Ok(None)` if the record is absent from the ZSet (deleted or never written).
+    /// Returns `Err` if a storage error occurs on the disk fallback path.
     ///
     /// Cache misses do NOT populate the cache (requires `&self`). The cache is written
     /// only by Create/Update/bulk_load paths. Use `get_row_record` on the write→read
@@ -375,12 +381,18 @@ impl SpookyDb {
     ///
     /// Usage:
     /// ```rust,ignore
-    /// let bytes = db.get_record_bytes("users", "alice").unwrap();
+    /// let bytes = db.get_record_bytes("users", "alice")?.unwrap();
     /// let (buf, count) = from_bytes(&bytes).unwrap();
     /// let record = SpookyRecord::new(buf, count);
     /// let age = record.get_i64("age");
     /// ```
-    pub fn get_record_bytes(&self, table: &str, id: &str) -> Option<Vec<u8>> {
+    pub fn get_record_bytes(
+        &self,
+        table: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, SpookyDbError> {
+        validate_table_name(table)?;
+
         // ZSet guard — avoids unnecessary redb open for absent records.
         let present = self
             .zsets
@@ -390,35 +402,43 @@ impl SpookyDb {
             .unwrap_or(0)
             > 0;
         if !present {
-            return None;
+            return Ok(None);
         }
 
         // Cache hit — peek does not update LRU recency (requires &mut self).
         let cache_key = (SmolStr::new(table), SmolStr::new(id));
         if let Some(bytes) = self.row_cache.peek(&cache_key) {
-            return Some(bytes.clone());
+            return Ok(Some(bytes.clone()));
         }
 
-        // Cache miss — fall back to redb.
+        // Cache miss — fall back to redb; propagate storage errors.
         let db_key = make_key(table, id);
-        let read_txn = self.db.begin_read().ok()?;
-        let tbl = read_txn.open_table(RECORDS_TABLE).ok()?;
-        tbl.get(db_key.as_str())
-            .ok()?
-            .map(|guard| guard.value().to_vec())
+        let read_txn = self.db.begin_read()?;
+        let tbl = read_txn.open_table(RECORDS_TABLE)?;
+        match tbl.get(db_key.as_str())? {
+            Some(guard) => Ok(Some(guard.value().to_vec())),
+            None => Ok(None),
+        }
     }
 
     /// Zero-copy borrowed SpookyRecord for the view evaluation hot path.
     ///
-    /// Returns `Some(SpookyRecord<'a>)` if and only if the record is in the LRU row cache.
-    /// Returns `None` if the record is absent **or** if it exists on disk but has been
+    /// Returns `Ok(Some(SpookyRecord<'a>))` if and only if the record is in the LRU row cache.
+    /// Returns `Ok(None)` if the record is absent **or** if it exists on disk but has been
     /// evicted from the cache.
+    /// Returns `Err` if the table name is invalid.
     ///
     /// **Cache miss fallback**: call `get_record_bytes(table, id)` which reads from redb.
     ///
     /// For the streaming pipeline hot path (write then read in the same tick), records
     /// are always in the cache — writes populate it immediately. Zero I/O, zero allocation.
-    pub fn get_row_record<'a>(&'a self, table: &str, id: &str) -> Option<SpookyRecord<'a>> {
+    pub fn get_row_record<'a>(
+        &'a self,
+        table: &str,
+        id: &str,
+    ) -> Result<Option<SpookyRecord<'a>>, SpookyDbError> {
+        validate_table_name(table)?;
+
         // ZSet guard — avoid cache lookup for absent records.
         let present = self
             .zsets
@@ -428,14 +448,19 @@ impl SpookyDb {
             .unwrap_or(0)
             > 0;
         if !present {
-            return None;
+            return Ok(None);
         }
 
         // Cache-only — peek returns &Vec<u8> with lifetime 'a.
         let cache_key = (SmolStr::new(table), SmolStr::new(id));
-        let bytes = self.row_cache.peek(&cache_key)?;
-        let (buf, count) = from_bytes(bytes).ok()?;
-        Some(SpookyRecord::new(buf, count))
+        let Some(bytes) = self.row_cache.peek(&cache_key) else {
+            return Ok(None);
+        };
+        let (buf, count) = match from_bytes(bytes) {
+            Ok(pair) => pair,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(SpookyRecord::new(buf, count)))
     }
 
     /// Reconstruct a partial `SpookyValue::Object` from a stored record.
@@ -454,7 +479,7 @@ impl SpookyDb {
         id: &str,
         fields: &[&str],
     ) -> Result<Option<SpookyValue>, SpookyDbError> {
-        let raw = match self.get_record_bytes(table, id) {
+        let raw = match self.get_record_bytes(table, id)? {
             Some(b) => b,
             None => return Ok(None),
         };
@@ -478,6 +503,7 @@ impl SpookyDb {
     /// Fast path: if the record is not in the ZSet (weight = 0), it cannot
     /// have a version entry — returns `None` without opening a redb transaction.
     pub fn get_version(&self, table: &str, id: &str) -> Result<Option<u64>, SpookyDbError> {
+        validate_table_name(table)?;
         // Fast path: absent from ZSet → definitely not in VERSION_TABLE.
         let present = self
             .zsets
@@ -511,6 +537,7 @@ impl SpookyDb {
     ///
     /// This is what `eval_snapshot(Scan)` borrows for the duration of a view tick.
     pub fn get_table_zset(&self, table: &str) -> Option<&ZSet> {
+        validate_table_name(table).ok()?;
         self.zsets.get(table)
     }
 
@@ -599,9 +626,13 @@ pub trait DbBackend {
     /// Zero-copy ZSet access. Borrowed from memory — zero I/O.
     fn get_table_zset(&self, table: &str) -> Option<&ZSet>;
 
-    /// Raw bytes for a record, served from in-memory cache.
-    /// Returns `None` if the record is absent. Zero I/O — never fails.
-    fn get_record_bytes(&self, table: &str, id: &str) -> Option<Vec<u8>>;
+    /// Raw bytes for a record, served from in-memory cache with redb fallback.
+    /// Returns `Ok(None)` if the record is absent. Returns `Err` on storage errors.
+    fn get_record_bytes(
+        &self,
+        table: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, SpookyDbError>;
 
     /// Zero-copy borrowed record access. Returns `None` if the record is absent.
     ///
@@ -660,7 +691,11 @@ impl DbBackend for SpookyDb {
         self.get_table_zset(table)
     }
 
-    fn get_record_bytes(&self, table: &str, id: &str) -> Option<Vec<u8>> {
+    fn get_record_bytes(
+        &self,
+        table: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, SpookyDbError> {
         SpookyDb::get_record_bytes(self, table, id)
     }
 
@@ -792,7 +827,7 @@ mod tests {
         assert_eq!(db.get_zset_weight("users", "alice"), 1);
 
         // Get raw bytes back
-        let fetched = db.get_record_bytes("users", "alice").expect("should exist");
+        let fetched = db.get_record_bytes("users", "alice")?.expect("should exist");
         assert_eq!(fetched, data);
 
         // Version
@@ -801,7 +836,7 @@ mod tests {
         // Delete
         db.apply_mutation("users", Operation::Delete, "alice", None, None)?;
         assert_eq!(db.get_zset_weight("users", "alice"), 0);
-        assert!(db.get_record_bytes("users", "alice").is_none());
+        assert!(db.get_record_bytes("users", "alice")?.is_none());
         assert_eq!(db.table_len("users"), 0);
 
         Ok(())
@@ -968,10 +1003,10 @@ mod tests {
         db.apply_mutation("users", Operation::Create, "alice", Some(&data), None)?;
 
         // get_record_bytes must return without touching redb.
-        assert_eq!(db.get_record_bytes("users", "alice"), Some(data.clone()));
+        assert_eq!(db.get_record_bytes("users", "alice")?, Some(data.clone()));
 
         // get_row_record must return a valid borrowed record.
-        let record = db.get_row_record("users", "alice").expect("should be in cache");
+        let record = db.get_row_record("users", "alice")?.expect("should be in cache");
         let age = record.get_i64("age");
         assert!(age.is_some(), "age field should be readable from cached record");
 
@@ -988,8 +1023,8 @@ mod tests {
         db.apply_mutation("users", Operation::Create, "alice", Some(&data), None)?;
         db.apply_mutation("users", Operation::Delete, "alice", None, None)?;
 
-        assert_eq!(db.get_record_bytes("users", "alice"), None);
-        assert!(db.get_row_record("users", "alice").is_none());
+        assert_eq!(db.get_record_bytes("users", "alice")?, None);
+        assert!(db.get_row_record("users", "alice")?.is_none());
         Ok(())
     }
 
@@ -1012,11 +1047,11 @@ mod tests {
         assert_eq!(db2.get_zset_weight("users", "alice"), 1);
 
         // get_record_bytes falls back to redb on cache miss — still returns data.
-        assert_eq!(db2.get_record_bytes("users", "alice"), Some(data));
+        assert_eq!(db2.get_record_bytes("users", "alice")?, Some(data));
 
         // get_row_record returns None because the cache is cold after reopen.
         assert!(
-            db2.get_row_record("users", "alice").is_none(),
+            db2.get_row_record("users", "alice")?.is_none(),
             "cold cache: get_row_record must return None until a write warms the entry"
         );
         Ok(())
@@ -1040,11 +1075,11 @@ mod tests {
 
         db.apply_mutation("users", Operation::Create, "alice", Some(&data), None)?;
         assert_eq!(db.get_zset_weight("users", "alice"), 1);
-        assert!(db.get_record_bytes("users", "alice").is_some());
+        assert!(db.get_record_bytes("users", "alice")?.is_some());
 
         db.apply_mutation("users", Operation::Delete, "alice", None, None)?;
         assert_eq!(db.get_zset_weight("users", "alice"), 0);
-        assert!(db.get_record_bytes("users", "alice").is_none());
+        assert!(db.get_record_bytes("users", "alice")?.is_none());
         Ok(())
     }
 
@@ -1096,11 +1131,11 @@ mod tests {
         assert_eq!(db2.get_zset_weight("users", "alice"), 1); // ZSet present
 
         // get_row_record returns None (cold cache after reopen).
-        assert!(db2.get_row_record("users", "alice").is_none());
+        assert!(db2.get_row_record("users", "alice")?.is_none());
 
         // get_record_bytes falls back to redb — still returns data.
         let fetched = db2
-            .get_record_bytes("users", "alice")
+            .get_record_bytes("users", "alice")?
             .expect("redb fallback must work on cache miss");
         assert_eq!(fetched, data);
 
@@ -1133,14 +1168,14 @@ mod tests {
         assert_eq!(db.get_zset_weight("t", "r3"), 1);
 
         // get_record_bytes works for all 3 (redb fallback for evicted r1).
-        assert!(db.get_record_bytes("t", "r1").is_some(), "redb fallback for evicted r1");
-        assert!(db.get_record_bytes("t", "r2").is_some());
-        assert!(db.get_record_bytes("t", "r3").is_some());
+        assert!(db.get_record_bytes("t", "r1")?.is_some(), "redb fallback for evicted r1");
+        assert!(db.get_record_bytes("t", "r2")?.is_some());
+        assert!(db.get_record_bytes("t", "r3")?.is_some());
 
         // get_row_record: r1 evicted, r2 and r3 still in cache.
-        assert!(db.get_row_record("t", "r1").is_none(), "r1 should be evicted from cache");
-        assert!(db.get_row_record("t", "r2").is_some(), "r2 should still be in cache");
-        assert!(db.get_row_record("t", "r3").is_some(), "r3 should be in cache");
+        assert!(db.get_row_record("t", "r1")?.is_none(), "r1 should be evicted from cache");
+        assert!(db.get_row_record("t", "r2")?.is_some(), "r2 should still be in cache");
+        assert!(db.get_row_record("t", "r3")?.is_some(), "r3 should be in cache");
 
         Ok(())
     }
@@ -1169,7 +1204,7 @@ mod tests {
 
         // Cache has at most 5.
         let cached_count = (0u32..10)
-            .filter(|i| db.get_row_record("t", &format!("r{i}")).is_some())
+            .filter(|i| db.get_row_record("t", &format!("r{i}")).ok().flatten().is_some())
             .count();
         assert!(cached_count <= 5, "cache exceeded capacity: {cached_count} entries cached");
 
@@ -1177,7 +1212,7 @@ mod tests {
         for i in 0u32..10 {
             let id = format!("r{i}");
             assert!(
-                db.get_record_bytes("t", &id).is_some(),
+                db.get_record_bytes("t", &id)?.is_some(),
                 "redb fallback failed for r{i}"
             );
         }
@@ -1193,13 +1228,13 @@ mod tests {
         let (data, _) = from_cbor(&cbor)?;
 
         db.apply_mutation("t", Operation::Create, "r1", Some(&data), None)?;
-        assert!(db.get_row_record("t", "r1").is_some(), "r1 should be in cache after create");
+        assert!(db.get_row_record("t", "r1")?.is_some(), "r1 should be in cache after create");
 
         db.apply_mutation("t", Operation::Delete, "r1", None, None)?;
         // ZSet and cache must both be gone; ZSet guard prevents redb read.
         assert_eq!(db.get_zset_weight("t", "r1"), 0);
-        assert!(db.get_row_record("t", "r1").is_none());
-        assert!(db.get_record_bytes("t", "r1").is_none());
+        assert!(db.get_row_record("t", "r1")?.is_none());
+        assert!(db.get_record_bytes("t", "r1")?.is_none());
 
         Ok(())
     }
@@ -1213,17 +1248,85 @@ mod tests {
         let (data, _) = from_cbor(&cbor)?;
 
         // Non-existent record returns None.
-        assert!(db.get_row_record("users", "alice").is_none());
+        assert!(db.get_row_record("users", "alice")?.is_none());
 
         // Insert a record, then verify we can read a field from the zero-copy view.
         db.apply_mutation("users", Operation::Create, "alice", Some(&data), None)?;
 
-        let record = db.get_row_record("users", "alice").expect("should be in cache");
+        let record = db.get_row_record("users", "alice")?.expect("should be in cache");
         // The CBOR fixture has "age" = 28 (i64).
         let age = record.get_i64("age");
         assert!(age.is_some(), "age field should be readable from cached record");
         assert_eq!(age.unwrap(), 28);
 
         Ok(())
+    }
+
+    #[test]
+    fn zset_not_mutated_before_commit() {
+        use crate::spooky_value::{SpookyNumber, SpookyValue};
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = SpookyDb::new(dir.path().join("test.redb")).unwrap();
+
+        let mut buf = Vec::new();
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(SmolStr::new("x"), SpookyValue::Number(SpookyNumber::I64(1)));
+        crate::serialization::serialize_into(&m, &mut buf).unwrap();
+
+        let result = db.apply_batch(vec![DbMutation {
+            table: SmolStr::new("users"),
+            id: SmolStr::new("u1"),
+            op: Operation::Create,
+            data: Some(buf),
+            version: None,
+        }]).unwrap();
+
+        let zset = db.get_table_zset("users").unwrap();
+        assert_eq!(zset.get("u1"), Some(&1i64));
+        assert_eq!(result.membership_deltas["users"].get("u1"), Some(&1i64));
+    }
+
+    #[test]
+    fn rejects_colon_in_table_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = SpookyDb::new(dir.path().join("test.redb")).unwrap();
+
+        let result = db.apply_batch(vec![DbMutation {
+            table: SmolStr::new("bad:name"),
+            id: SmolStr::new("rec1"),
+            op: Operation::Delete,
+            data: None,
+            version: None,
+        }]);
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains(':'), "error message should mention the colon: {msg}");
+    }
+
+    #[test]
+    fn rejects_empty_table_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = SpookyDb::new(dir.path().join("test.redb")).unwrap();
+
+        let result = db.apply_batch(vec![DbMutation {
+            table: SmolStr::new(""),
+            id: SmolStr::new("rec1"),
+            op: Operation::Delete,
+            data: None,
+            version: None,
+        }]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_record_returns_none_for_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SpookyDb::new(dir.path().join("test.redb")).unwrap();
+
+        let result = db.get_row_record("users", "nonexistent");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(result.unwrap().is_none());
     }
 }

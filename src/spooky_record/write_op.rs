@@ -94,6 +94,12 @@ impl SpookyRecordMut {
                 actual: meta.type_tag,
             });
         }
+        if meta.data_len != 8 {
+            return Err(RecordError::LengthMismatch {
+                expected: 8,
+                actual: meta.data_len,
+            });
+        }
         self.data_buf[meta.data_offset..meta.data_offset + 8].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
@@ -106,6 +112,12 @@ impl SpookyRecordMut {
             return Err(RecordError::TypeMismatch {
                 expected: TAG_U64,
                 actual: meta.type_tag,
+            });
+        }
+        if meta.data_len != 8 {
+            return Err(RecordError::LengthMismatch {
+                expected: 8,
+                actual: meta.data_len,
             });
         }
         self.data_buf[meta.data_offset..meta.data_offset + 8].copy_from_slice(&value.to_le_bytes());
@@ -122,6 +134,12 @@ impl SpookyRecordMut {
                 actual: meta.type_tag,
             });
         }
+        if meta.data_len != 8 {
+            return Err(RecordError::LengthMismatch {
+                expected: 8,
+                actual: meta.data_len,
+            });
+        }
         self.data_buf[meta.data_offset..meta.data_offset + 8].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
@@ -134,6 +152,12 @@ impl SpookyRecordMut {
             return Err(RecordError::TypeMismatch {
                 expected: TAG_BOOL,
                 actual: meta.type_tag,
+            });
+        }
+        if meta.data_len != 1 {
+            return Err(RecordError::LengthMismatch {
+                expected: 1,
+                actual: meta.data_len,
             });
         }
         self.data_buf[meta.data_offset] = value as u8;
@@ -249,7 +273,7 @@ impl SpookyRecordMut {
     #[inline]
     pub fn set_i64_at(&mut self, slot: &FieldSlot, value: i64) -> Result<(), RecordError> {
         debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
-        if slot.type_tag != TAG_I64 {
+        if slot.type_tag != TAG_I64 || slot.data_len != 8 {
             return Err(RecordError::TypeMismatch {
                 expected: TAG_I64,
                 actual: slot.type_tag,
@@ -263,7 +287,7 @@ impl SpookyRecordMut {
     #[inline]
     pub fn set_u64_at(&mut self, slot: &FieldSlot, value: u64) -> Result<(), RecordError> {
         debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
-        if slot.type_tag != TAG_U64 {
+        if slot.type_tag != TAG_U64 || slot.data_len != 8 {
             return Err(RecordError::TypeMismatch {
                 expected: TAG_U64,
                 actual: slot.type_tag,
@@ -277,7 +301,7 @@ impl SpookyRecordMut {
     #[inline]
     pub fn set_f64_at(&mut self, slot: &FieldSlot, value: f64) -> Result<(), RecordError> {
         debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
-        if slot.type_tag != TAG_F64 {
+        if slot.type_tag != TAG_F64 || slot.data_len != 8 {
             return Err(RecordError::TypeMismatch {
                 expected: TAG_F64,
                 actual: slot.type_tag,
@@ -291,7 +315,7 @@ impl SpookyRecordMut {
     #[inline]
     pub fn set_bool_at(&mut self, slot: &FieldSlot, value: bool) -> Result<(), RecordError> {
         debug_assert_eq!(slot.generation, self.generation, "stale FieldSlot");
-        if slot.type_tag != TAG_BOOL {
+        if slot.type_tag != TAG_BOOL || slot.data_len != 1 {
             return Err(RecordError::TypeMismatch {
                 expected: TAG_BOOL,
                 actual: slot.type_tag,

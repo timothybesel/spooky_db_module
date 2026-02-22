@@ -130,6 +130,7 @@ impl Operation {
 
 /// Return value of `apply_batch`. Contains all per-table deltas accumulated
 /// in a single pass — no extra allocations after the batch commit.
+#[derive(Debug)]
 pub struct BatchMutationResult {
     /// Per-table ZSet weight deltas (Create = +1, Delete = -1, Update = 0).
     /// Key: table name → ZSet<record_id, weight_delta>.

@@ -1611,7 +1611,7 @@ mod spooky_record_mut_tests {
         // Build record A
         let (buf_a, _fc_a) = from_spooky(&value_a).unwrap();
         let cap_after_a = buf_a.capacity();
-        
+
         // Reuse that buffer for record B
         let mut buf_b = buf_a;
         serialize_into(&map_b, &mut buf_b).unwrap();
@@ -1627,5 +1627,36 @@ mod spooky_record_mut_tests {
 
         // A's data should be gone
         assert_eq!(rec_b.get_str("id"), None);
+    }
+
+    // ── Fix 0.5: data_len guard tests ───────────────────────────────────────
+
+    /// set_bool must reject a field whose type is not TAG_BOOL (e.g. an i64 field).
+    /// Coverage: type mismatch path of the new data_len-guarded set_bool.
+    /// (set_i64 wrong-type is already covered by test_typed_setter_type_mismatch)
+    #[test]
+    fn set_bool_rejects_wrong_type() {
+        let mut rec = make_record_mut(); // has "age" as i64
+        let err = rec.set_bool("age", true).unwrap_err();
+        assert!(
+            matches!(err, RecordError::TypeMismatch { .. }),
+            "expected TypeMismatch, got {err:?}"
+        );
+    }
+
+    /// set_i64_at must panic in debug builds when the FieldSlot is stale.
+    /// This specifically tests the write path (set_i64_at) with a splice-based
+    /// generation bump, complementing test_stale_slot_debug_panic which uses
+    /// get_i64_at and an add_field bump.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "stale FieldSlot")]
+    fn set_i64_at_panics_on_stale_slot() {
+        let mut rec = make_record_mut(); // has "age" i64, "name" str
+        let slot = rec.resolve("age").unwrap();
+        // set_str with a different length triggers a splice → generation += 1
+        rec.set_str("name", "longer-label-here").unwrap();
+        // Using the stale slot must panic in debug builds
+        let _ = rec.set_i64_at(&slot, 99);
     }
 }

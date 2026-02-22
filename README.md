@@ -235,7 +235,7 @@ SpookyDb provides transactional disk persistence backed by [redb](https://github
 
 > 1. **One write transaction per batch** — `apply_batch` groups N mutations into a single redb write transaction (one fsync), regardless of how many records or tables are touched.
 > 2. **ZSets always in memory** — membership queries (`get_table_zset`, `get_zset_weight`) never touch disk. ZSets are rebuilt from `RECORDS_TABLE` on startup.
-> 3. **LRU row cache** — recently written records are served from a bounded in-memory LRU cache (default 10 000 records). Cache misses fall back to redb. `get_row_record` returns `None` on miss — it is not guaranteed to return bytes if a record exists but has been evicted.
+> 3. **LRU row cache** — recently written records are served from a bounded in-memory LRU cache (default 10 000 records). Cache misses fall back to redb. `get_row_record` returns `Ok(None)` on cache miss — it is not guaranteed to return bytes if a record exists but has been evicted. Disk errors propagate as `Err` rather than silently becoming `None`.
 
 Table names must not contain `':'`. Record IDs may contain `':'` (the key format uses `split_once` on the first `':'`).
 
@@ -292,13 +292,15 @@ use spooky_db_module::spooky_record::read_op::SpookyReadable;
 let zset = db.get_table_zset("users");
 
 // Fast path: record in LRU cache — zero I/O, borrowed SpookyRecord<'_>
-if let Some(record) = db.get_row_record("users", "user:abc123") {
+// Returns Ok(None) on cache miss; Err on storage failure
+if let Some(record) = db.get_row_record("users", "user:abc123")? {
     let name = record.get_str("name"); // Option<&str>, zero-copy
     let age  = record.get_i64("age");  // Option<i64>
 }
 
 // Fallback: cache miss — ZSet guard → redb read, returns owned Vec<u8>
-if let Some(bytes) = db.get_record_bytes("users", "user:abc123") {
+// Disk I/O errors propagate as Err rather than silently becoming None
+if let Some(bytes) = db.get_record_bytes("users", "user:abc123")? {
     let (buf, count) = from_bytes(&bytes).unwrap();
     let record = SpookyRecord::new(buf, count);
     let age = record.get_i64("age");
@@ -331,8 +333,8 @@ let partial = db
 
 | Method | Returns | Description |
 |---|---|---|
-| `get_row_record(table, id)` | `Option<SpookyRecord<'_>>` | Zero-copy borrowed record. Cache-only: returns `None` on cache miss even if the record exists on disk. |
-| `get_record_bytes(table, id)` | `Option<Vec<u8>>` | ZSet guard → LRU peek → redb fallback on miss. Never returns bytes for a deleted or absent record. |
+| `get_row_record(table, id)` | `Result<Option<SpookyRecord<'_>>, SpookyDbError>` | Zero-copy borrowed record. Cache-only: returns `Ok(None)` on cache miss even if the record exists on disk. Returns `Err` only on storage failure. |
+| `get_record_bytes(table, id)` | `Result<Option<Vec<u8>>, SpookyDbError>` | ZSet guard → LRU peek → redb fallback on miss. Returns `Ok(None)` for absent/deleted records; `Err` propagates disk I/O errors instead of silently converting them to `None`. |
 | `get_record_typed(table, id, fields: &[&str])` | `Result<Option<SpookyValue>, SpookyDbError>` | Partial field reconstruction; only the named fields are recovered (names are not stored in the binary format). |
 | `get_version(table, id)` | `Result<Option<u64>, SpookyDbError>` | Read the stored version number for a record |
 
@@ -402,7 +404,7 @@ let partial = db
 ```rust
 pub trait DbBackend {
     fn get_table_zset(&self, table: &str) -> Option<&ZSet>;
-    fn get_record_bytes(&self, table: &str, id: &str) -> Option<Vec<u8>>;
+    fn get_record_bytes(&self, table: &str, id: &str) -> Result<Option<Vec<u8>>, SpookyDbError>;
     fn get_row_record_bytes<'a>(&'a self, table: &str, id: &str) -> Option<&'a [u8]>;
     fn ensure_table(&mut self, table: &str) -> Result<(), SpookyDbError>;
     fn apply_mutation(
