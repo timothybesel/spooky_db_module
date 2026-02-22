@@ -34,11 +34,11 @@ SpookyDB uses a **hybrid binary format** that combines native encoding for flat 
                            ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │   SpookyDb (Persistence Layer)                                     │
-│   ├── RECORDS_TABLE  ── redb ── "table:id" → &[u8]                │
-│   ├── VERSION_TABLE  ── redb ── "table:id" → u64                  │
+│   ├── RECORDS_TABLE  ── redb ── "table:id" → &[u8]                 │
+│   ├── VERSION_TABLE  ── redb ── "table:id" → u64                   │
 │   └── ZSets (in-memory) ── FastMap<SmolStr, ZSet>                  │
 │       • zero I/O membership queries                                │
-│       • rebuilt from RECORDS_TABLE on startup                       │
+│       • rebuilt from RECORDS_TABLE on startup                      │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
